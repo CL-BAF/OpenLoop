@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.log
+.env
+# OpenLoop runtime state (per-project)
+.opencode-orchestrator/

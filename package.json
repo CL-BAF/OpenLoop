@@ -1,0 +1,23 @@
+{
+  "name": "openloop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OpenLoop — OpenCode plugin coordinating independent coder + reviewer sessions in a review/fix loop.",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run -ws build --if-present",
+    "typecheck": "npm run -ws typecheck --if-present",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
