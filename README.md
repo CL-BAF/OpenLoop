@@ -68,8 +68,8 @@ No MCP is used for session-to-session messaging. MCP is intentionally optional f
 ### 2. Install
 
 ```powershell
-git clone <this repo> BackendAI
-cd BackendAI
+git clone https://github.com/CL-BAF/OpenLoop.git
+cd OpenLoop
 npm install
 npm run build
 ```
