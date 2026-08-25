@@ -8,14 +8,20 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run -ws build --if-present",
-    "typecheck": "npm run -ws typecheck --if-present",
+    "build": "npm run --workspaces --if-present build && node scripts/build-loader.mjs",
+    "postinstall": "npm run build",
+    "install:project": "node scripts/install-project.mjs",
+    "pretypecheck": "npm run build",
+    "typecheck": "npm run --workspaces --if-present typecheck",
+    "pretest": "npm run build",
     "test": "vitest run",
+    "test:live": "npm run build && node scripts/live-opencode.mjs",
     "test:watch": "vitest"
   },
   "devDependencies": {
+    "esbuild": "^0.28.2",
     "typescript": "^5.4.0",
-    "vitest": "^1.6.0"
+    "vitest": "^4.1.11"
   },
   "engines": {
     "node": ">=20"

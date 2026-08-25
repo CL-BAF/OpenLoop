@@ -1,10 +1,11 @@
 import type {OpencodeClient} from "@opencode-ai/sdk/v2";
-import type {AgentV2Info, ModelV2Info} from "@opencode-ai/sdk/v2";
+import type {Agent, Model} from "@opencode-ai/sdk/v2";
 import type {ModelRef, SessionSelection} from "@openloop/core";
+import {unwrap} from "./sdk.js";
 
 export interface AgentOption {
   id: string;
-  mode: AgentV2Info["mode"];
+  mode: Agent["mode"];
   description?: string;
 }
 
@@ -12,7 +13,7 @@ export interface ModelOption {
   providerID: string;
   modelID: string;
   name: string;
-  status: ModelV2Info["status"];
+  status: Model["status"];
   enabled: boolean;
 }
 
@@ -23,26 +24,28 @@ export interface Catalog {
 
 /** Query the live OpenCode environment for available agents and models. */
 export async function fetchCatalog(client: OpencodeClient, directory: string): Promise<Catalog> {
-  const [agentRes, modelRes] = await Promise.all([
-    client.v2.agent.list({location: {directory}}),
-    client.v2.model.list({location: {directory}}),
+  const [agentData, providerData] = await Promise.all([
+    // The legacy-named /agent route is the current configured agent list. The
+    // newer /api/agent route may be empty when no desktop workspace exists.
+    unwrap(client.app.agents({directory}), "list agents"),
+    // /api/model is the universal models.dev catalog in current OpenCode, not
+    // the set the user can actually invoke. /config/providers returns only
+    // active/configured providers and also includes project-local custom ones.
+    unwrap(client.config.providers({directory}), "list configured providers"),
   ]);
-  const agentData = (agentRes.data as {data?: AgentV2Info[]} | undefined)?.data ?? [];
-  const modelData = (modelRes.data as {data?: ModelV2Info[]} | undefined)?.data ?? [];
-
   const agents: AgentOption[] = agentData
     .filter((a) => !a.hidden && (a.mode === "primary" || a.mode === "all"))
-    .map((a) => ({id: a.id, mode: a.mode, description: a.description}));
+    .map((a) => ({id: a.name, mode: a.mode, description: a.description}));
 
-  const models: ModelOption[] = modelData
-    .filter((m) => m.enabled)
-    .map((m) => ({
-      providerID: m.providerID,
-      modelID: m.id,
-      name: m.name,
-      status: m.status,
-      enabled: m.enabled,
-    }));
+  const models: ModelOption[] = providerData.providers.flatMap((provider) =>
+    Object.values(provider.models).map((model) => ({
+      providerID: provider.id,
+      modelID: model.id,
+      name: model.name,
+      status: model.status,
+      enabled: true,
+    })),
+  );
 
   return {agents, models};
 }
@@ -88,7 +91,9 @@ export function parseModelRef(value: string | undefined | null): ModelRef | null
   if (!value) return null;
   const trimmed = value.trim();
   if (!trimmed) return null;
-  const parts = trimmed.split("/");
-  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
-  return {providerID: parts[0]!, modelID: parts[1]!};
+  const separator = trimmed.indexOf("/");
+  const providerID = trimmed.slice(0, separator).trim();
+  const modelID = trimmed.slice(separator + 1).trim();
+  if (separator <= 0 || !providerID || !modelID) return null;
+  return {providerID, modelID};
 }

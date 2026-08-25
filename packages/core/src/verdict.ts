@@ -54,10 +54,13 @@ export interface ParsedVerdict {
  * text. Handles malformed output gracefully and never throws.
  */
 export function parseVerdict(turn: TurnResult): ParsedVerdict {
-  // Preferred: SDK structured output.
+  // Compatibility path for servers that provide a structured field. Current
+  // OpenLoop reviewer prompts use validated JSON text so message history stays
+  // readable across affected OpenCode versions.
   if (turn.structured && typeof turn.structured === "object") {
-    const parsed = coerceVerdictObject(turn.structured as VerdictShape);
-    if (parsed) return {...parsed, fromTextFallback: false, malformed: false};
+    const shape = turn.structured as VerdictShape;
+    const parsed = coerceVerdictObject(shape);
+    if (parsed) return {...parsed, fromTextFallback: false, malformed: !isCompleteVerdictShape(shape)};
   }
 
   // Fallback: extract JSON from text.
@@ -65,14 +68,24 @@ export function parseVerdict(turn: TurnResult): ParsedVerdict {
   if (jsonText !== null) {
     try {
       const obj = JSON.parse(jsonText) as unknown;
-      const parsed = coerceVerdictObject(obj as VerdictShape);
-      if (parsed) return {...parsed, fromTextFallback: true, malformed: false};
+      const shape = obj as VerdictShape;
+      const parsed = coerceVerdictObject(shape);
+      if (parsed) return {...parsed, fromTextFallback: true, malformed: !isCompleteVerdictShape(shape)};
     } catch {
       // fall through to best-effort
     }
   }
 
   return inferFromText(turn.text);
+}
+
+function isCompleteVerdictShape(obj: VerdictShape): boolean {
+  if (!obj || typeof obj !== "object") return false;
+  if (!coerceVerdict(obj.verdict) || typeof obj.summary !== "string") return false;
+  if (!Array.isArray(obj.findings) || typeof obj.next_coder_prompt !== "string") return false;
+  if (!obj.research || typeof obj.research !== "object"
+    || typeof (obj.research as ResearchShape).performed !== "boolean") return false;
+  return obj.findings.every((finding) => coerceFinding(finding as FindingShape) !== null);
 }
 
 function coerceVerdictObject(obj: VerdictShape): Omit<ParsedVerdict, "fromTextFallback" | "malformed"> | null {
@@ -215,8 +228,10 @@ function inferFromText(text: string): ParsedVerdict {
  * Low-severity cosmetic findings alone never force another round.
  */
 export function requiresChanges(v: ParsedVerdict): boolean {
-  if (v.verdict !== "CHANGES_REQUIRED") return false;
   const material = v.findings.filter((f) => f.severity !== "low");
+  // A material finding wins over an inconsistent PASS label. Conversely, a
+  // CHANGES_REQUIRED verdict containing cosmetic-only findings does not keep
+  // the loop alive forever.
   return material.length > 0;
 }
 

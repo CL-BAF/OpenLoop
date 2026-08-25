@@ -1,82 +1,101 @@
 # OpenLoop
 
-OpenLoop is an **OpenCode plugin** that coordinates two independent OpenCode sessions — a **CODER** and a **REVIEWER** — in an automated review/fix loop until the reviewer passes the work or a maximum number of rounds is reached.
+OpenLoop is an OpenCode server plugin that runs a coder and an independent reviewer in two separate root sessions:
 
-```
-User Goal
-   ↓
-Coder session  ──► implement + test
-   ↓
-Reviewer session  ──► review code  +  engineer next coder prompt  +  research (when useful)
-   ↓
-Coder session  ──► fix + verify
-   ↓
-Reviewer again
-   ↓
-PASS  (or max rounds)
+```text
+User goal
+  -> CODER implements and verifies
+  -> REVIEWER inspects the repository and exact coder diff
+  -> CODER receives focused review guidance and fixes material findings
+  -> REVIEWER checks again
+  -> PASS, error, stop, or maximum rounds
 ```
 
-The reviewer acts as **Code Reviewer + Prompt Engineer + Researcher**:
-- **Code Reviewer** — independently inspects the repository and diff (never trusts the coder's summary).
-- **Prompt Engineer** — writes a focused `next_coder_prompt` OpenLoop sends to the coder, improving it across rounds instead of dumping raw findings.
-- **Researcher** — periodically investigates whether OpenLoop/OpenCode itself could be improved, recording ideas in `future_improvements` without forcing them into the current task.
+OpenLoop is currently a source project, not a published npm plugin. Its installer copies a self-contained project-local plugin into the workspace where you want to use OpenLoop.
+
+## Compatibility verified in this repository
+
+- `@opencode-ai/plugin` 1.18.23
+- `@opencode-ai/sdk` 1.18.23, using its v2 client export
+- OpenCode CLI/server 1.18.23 on native Windows
+- Node.js 20 or newer
+
+The live Windows integration check starts an isolated real OpenCode 1.18.23 server with a deterministic local test provider. It discovers the plugin, registers all five tools, queries the active agent/model catalogs, creates two distinct root sessions, runs coder -> reviewer -> coder fix -> reviewer, and verifies PASS after round two. It exercises the actual plugin runtime without using provider credentials or editing this repository.
 
 ## Architecture
 
-```
+```text
 packages/
-  core/              framework-agnostic orchestration (no OpenCode SDK dependency)
-    src/types.ts        shared types (Finding, ReviewVerdict, Selections, …)
-    src/config.ts       env-based config + validation
-    src/verdict.ts      structured-output parsing (malformed-safe) + completion rules
-    src/prompts.ts      coder + reviewer system/user prompts + JSON output schema
-    src/machine.ts      deterministic state machine (returns Effects, never calls SDK)
-    src/state.ts        persisted loop state
-    src/selection.ts   persisted coder/reviewer agent+model selections
-    src/logging.ts      console logging
-  opencode-plugin/    OpenCode plugin (uses official SDK + plugin hooks)
-    src/index.ts        Plugin entry (Hooks: event, tool, dispose) + LoopRuntime
-    src/sdk.ts          SDK response unwrapping + read-only tool builder
-    src/catalog.ts      runtime agent/model discovery + selection validation
+  core/                 deterministic orchestration, prompts, validation, state
+  opencode-plugin/      OpenCode SDK adapter, tools, events, sessions, watchdog
+.opencode/plugins/
+  openloop.js           generated self-contained plugin for this checkout
+scripts/
+  build-loader.mjs      build the single-file plugin artifact
+  install-project.mjs   safe plugin installer for another workspace
+  live-opencode.mjs     isolated real-server integration check
 ```
 
-`core` contains the orchestration state machine and is fully testable without an OpenCode server. `opencode-plugin` drives the machine by interpreting its `Effect`s against the official OpenCode SDK and session events.
+The two worker sessions are created separately with `session.create()` and no `parentID`. They are therefore root sessions, not task/subagent sessions, not children of one another, and not the session that called `openloop_start_goal`.
 
-## Verified OpenCode APIs
+Agent and model choices are attached to each `promptAsync()` request. OpenLoop does not switch or mutate OpenCode's global/default agent or model.
 
-OpenLoop uses only official, current APIs from `@opencode-ai/sdk` v1.18.22 and `@opencode-ai/plugin` v1.18.22:
+## Install into a Windows/OpenCode Desktop project
 
-- **Plugin**: `Plugin` from `@opencode-ai/plugin` — `Hooks.event` (session.idle/status/error), `Hooks.tool` (custom tools), `Hooks.dispose`.
-- **Sessions**: `client.session.create` / `get` / `status` / `messages` / `diff` / `abort` / `promptAsync` (v2 SDK, for structured output `format`).
-- **Agent/model discovery**: `client.v2.agent.list()` and `client.v2.model.list()` — runtime catalog of available agents/models (only agents/models actually present are selectable).
-- **Per-turn agent/model**: the selected coder/reviewer agent and model are passed directly in each `promptAsync` call (`agent` and `model` parameters). This avoids v1/v2 `switchAgent`/`switchModel` endpoint mismatches and never changes the global OpenCode default model/agent.
-- **Structured output**: `format: {type: "json_schema", schema, retryCount}` on `promptAsync` for reliable reviewer verdicts, with graceful text-JSON fallback parsing (including recovery from `StructuredOutputError`).
-
-No MCP is used for session-to-session messaging. MCP is intentionally optional for a future adapter (see _Future MCP_ below).
-
-## Setup (Windows)
-
-### 1. Prerequisites
-
-- Node.js 20+ (`node --version`)
-- OpenCode installed and on PATH (`opencode --version`). Start the server with:
-  ```powershell
-  opencode serve --port 4096
-  ```
-- (Optional) OpenCode Desktop pointing at the same server.
-
-### 2. Install
+In PowerShell:
 
 ```powershell
 git clone https://github.com/CL-BAF/OpenLoop.git
 cd OpenLoop
 npm install
-npm run build
+npm run install:project -- "C:\path\to\your-project"
 ```
 
-### 3. Configure OpenCode to load the plugin
+`npm install` builds the TypeScript packages and self-contained plugin automatically. The installer copies that plugin to:
 
-Add to your project's `opencode.json` (or `opencode.jsonc`):
+```text
+C:\path\to\your-project\.opencode\plugins\openloop.js
+```
+
+It refuses to replace an existing plugin file. Inspect that file first and add `--force` only when you intentionally want OpenLoop to replace it:
+
+```powershell
+npm run install:project -- "C:\path\to\your-project" --force
+```
+
+Now fully quit OpenCode Desktop, reopen it, and open the target project. The installed file has no runtime dependency on the OpenLoop checkout or its `node_modules`; the checkout may be moved or removed. To deploy later source changes, run `npm run build`, rerun `install:project` with `--force`, and restart Desktop.
+
+To develop OpenLoop itself, clone and run `npm install`, then open this checkout in OpenCode. The build writes `.opencode/plugins/openloop.js`, so no separate installer step is needed for this repository.
+
+Do not add this to `opencode.json`:
+
+```json
+{
+  "plugin": ["@openloop/opencode-plugin"]
+}
+```
+
+That package name is not published. OpenCode treats entries in `plugin` as npm packages and its Bun installation step cannot resolve this private workspace package from the npm registry.
+
+No `plugin` configuration entry is needed. Current OpenCode automatically discovers JavaScript or TypeScript files under the opened project's:
+
+```text
+<project>/.opencode/plugins/openloop.js
+```
+
+If you previously added `"@openloop/opencode-plugin"` to a user-level or project-level OpenCode configuration, remove it. An invalid global entry can break plugin startup even when the project-local file is correct.
+
+Official loading references:
+
+- [OpenCode plugins](https://opencode.ai/docs/plugins/)
+- [OpenCode configuration](https://opencode.ai/docs/config/)
+- [OpenCode SDK](https://opencode.ai/docs/sdk/)
+
+The generated file is intentionally bundled and has exactly one runtime export: `OpenLoopPlugin`. This avoids resolving OpenLoop workspaces or npm dependencies from the target project, and it matches OpenCode's behavior of loading every export from a discovered module as a plugin factory. Do not replace it with `export *` from the development module, which also exports the testable `LoopRuntime` class.
+
+## Published-package installation
+
+There is no published-package installation today. `@openloop/opencode-plugin` returns npm `E404` as of 2026-08-25. If the package is published later, the expected OpenCode configuration will be:
 
 ```json
 {
@@ -85,105 +104,194 @@ Add to your project's `opencode.json` (or `opencode.jsonc`):
 }
 ```
 
-Or, for local development, create `.opencode/plugins/openloop.ts`:
+Do not use that configuration until both the plugin and its `@openloop/core` dependency are actually available from the registry.
 
-```ts
-export { OpenLoopPlugin as OpenLoop } from "@openloop/opencode-plugin";
-```
+## Run with OpenCode CLI/server
 
-> The plugin is loaded by the OpenCode server at startup. Both the CODER and REVIEWER sessions live on that same server, so any client connected to it (TUI, Desktop) can observe them.
-
-### 4. (Optional) Environment variables
-
-Copy `.env.example` to `.env` and adjust. These are read by the plugin at load time (set them in the environment that launches `opencode serve`):
-
-| Variable | Default | Description |
-|---|---|---|
-| `OPENLOOP_CODER_MODEL` | server default | `providerID/modelID` for the coder |
-| `OPENLOOP_CODER_AGENT` | `build` | coder agent |
-| `OPENLOOP_REVIEWER_MODEL` | server default | `providerID/modelID` for the reviewer (independent) |
-| `OPENLOOP_REVIEWER_AGENT` | `build` | reviewer agent |
-| `OPENLOOP_MAX_ROUNDS` | `6` | max coder→reviewer rounds |
-| `OPENLOOP_REVIEWER_READONLY` | `true` | disable file-edit tools for reviewer |
-| `OPENLOOP_TURN_TIMEOUT_MS` | `1800000` | per-turn timeout |
-| `OPENLOOP_POLL_INTERVAL_MS` | `2000` | status poll fallback interval |
-
-## Usage
-
-Inside an OpenCode session connected to the same server, the plugin registers these tools (callable by the AI or via chat):
-
-- **`openloop_setup`** — view/change coder & reviewer agent+model. With no args it lists the **currently available** agents and models (queried live via `client.v2.agent.list()` / `client.v2.model.list()`) and shows current selections. With args it validates against the live catalog and persists to `.opencode-orchestrator/selections.json` so you don't re-select every goal. **Does not change the global OpenCode default model/agent.**
-- **`openloop_config`** — show current selections and loop settings.
-- **`openloop_start_goal`** — start a coder/reviewer loop for a goal. Runs in the background.
-- **`openloop_status`** — `running` / `phase` / `round`.
-- **`openloop_stop`** — cooperatively stop the loop.
-
-Example chat flow:
-```
-> /openloop_setup                                  (see available agents/models)
-> /openloop_setup coder_model=ollama-cloud/glm-4.6 reviewer_agent=build
-> /openloop_start_goal  Debug the entire application and fix all reproducible issues.
-> /openloop_status                                 (monitor)
-```
-
-### Configuration via chat (no Desktop UI)
-
-OpenCode does not expose a documented stable Desktop plugin UI extension mechanism for arbitrary pickers. OpenLoop therefore implements the configuration flow through chat/custom-tool interaction (`openloop_setup` / `openloop_config`), which works in both the TUI and Desktop. Only agents/models actually present in your OpenCode environment are selectable.
-
-### OpenCode Desktop compatibility
-
-Both OpenLoop sessions are created on the same OpenCode server the plugin runs in. Any OpenCode client connected to that server (including Desktop, if connected to that server) can see and attach to those sessions. **Desktop-specific external session-attach behavior is version-dependent and not guaranteed by OpenLoop** — if your Desktop build cannot attach to externally-created sessions, the orchestration still works through the OpenCode server. This is a documented Desktop limitation, not an OpenLoop bug.
-
-## Reviewer structured output
-
-The reviewer returns JSON matching this schema (enforced via SDK structured output, with text-JSON fallback):
-
-```json
-{
-  "verdict": "PASS | CHANGES_REQUIRED",
-  "summary": "...",
-  "findings": [
-    { "severity": "critical|high|medium|low", "location": "...", "problem": "...",
-      "impact": "...", "recommended_fix": "...", "verification": "..." }
-  ],
-  "next_coder_prompt": "focused prompt for the next coder round",
-  "research": { "performed": true, "sources_checked": [], "relevant_discoveries": [], "recommended_improvements": [] },
-  "future_improvements": [ { "area": "...", "suggestion": "...", "rationale": "..." } ]
-}
-```
-
-- `next_coder_prompt` is what OpenLoop sends to the coder (not raw findings). The original user goal stays authoritative; the reviewer only improves HOW the coder approaches it.
-- `research.performed=false` when no research was needed.
-- Low-severity cosmetic findings alone never force another round (`requiresChanges` requires at least one non-low finding).
-- Malformed output is handled gracefully (best-effort inference), never throwing.
-
-## Reliability
-
-- Session IDs persisted in `.opencode-orchestrator/state.json` (resume session reuse across restarts; a new goal starts a fresh round sequence).
-- Reconnect/resume: stored sessions are verified to exist before reuse (via structured `NotFoundError` name check, not fragile message matching); missing ones are recreated.
-- **Per-turn timeout** (`OPENLOOP_TURN_TIMEOUT_MS`): if a busy session does not go idle within the timeout, it is aborted and the loop stops (prevents permanent deadlock on a hung session/model outage).
-- **Polling fallback** (`OPENLOOP_POLL_INTERVAL_MS`): periodically checks `session.status()` and recovers if an idle event was missed — non-aggressive, `unref`'d so it never keeps the process alive.
-- **Event-driven** primarily (session.idle) with the polling/timeout fallbacks above — no uncontrolled loops.
-- **Idempotent abort**: `machine.abort()` returns `STOP` on a second call, preventing the abort path from recursing or hammering the server.
-- Max-rounds protection; Ctrl+C / `openloop_stop` aborts the busy session cooperatively.
-- Busy-session guard: refuses to send a new prompt while a session is busy.
-- Failed `start()` cleans up runtime state so a subsequent `start()` works (no permanently stuck runtime).
-- Reviewer edits disabled via read-only tool map + system prompt.
-- `StructuredOutputError` falls back to parsing the assistant text before declaring ERROR.
-- Research and `future_improvements` from the reviewer are persisted in `state.json` round records.
-- Graceful error handling at every SDK boundary.
-
-## Development
+From the target project after installation:
 
 ```powershell
-npm run build         # build all packages
-npm run typecheck     # tsc --noEmit across packages
-npm test              # vitest run
-npm run test:watch    # vitest watch
+opencode
 ```
 
-Tests cover: verdict parsing (structured + text fallback + malformed), `requiresChanges` rules, `nextCoderPrompt` fallback, machine loop (PASS / MAX_ROUNDS / ABORTED / ERROR / next_coder_prompt use), and selection persistence.
+For an explicit server:
 
-## Future MCP (optional, not in v1)
+```powershell
+opencode serve --hostname 127.0.0.1 --port 4096
+```
 
-The architecture is extensible so a future `packages/mcp` adapter could expose `openloop_start_goal`, `openloop_status`, `openloop_get_findings`, `openloop_stop` to other MCP-compatible tools. The `core` state machine and `LoopRuntime` are already separable from the OpenCode plugin, so an MCP adapter would drive the same `LoopMachine` without duplicating orchestration logic. MCP is intentionally not used for session-to-session messaging in v1.
+OpenCode loads project-local plugins for the project directory it opens. Install the plugin separately in every project where OpenLoop should be available.
+
+## Run with OpenCode Desktop on Windows
+
+OpenCode Desktop runs a local OpenCode server sidecar. Install the plugin into the project, fully quit Desktop, reopen it, and open that project. The plugin is then in the project configuration scope that Desktop's server scans.
+
+For a Desktop client connected to a separate WSL/server instance, the plugin must exist and be built in the project as seen by that server. Installing it only on the Windows client side is insufficient because plugins execute in the server process.
+
+Desktop plugin behavior has changed across OpenCode releases. If tools do not appear:
+
+1. confirm Desktop opened the target directory containing `.opencode\plugins\openloop.js`;
+2. run `npm run build` in the OpenLoop checkout, then reinstall into the target with `--force`;
+3. fully quit and restart Desktop;
+4. inspect the OpenCode log for the target project's `.opencode/plugins/openloop.js`;
+5. reproduce with `opencode debug config --print-logs --log-level DEBUG` from the target project.
+
+## Use OpenLoop
+
+OpenLoop registers custom tools, not slash commands. Ask the active OpenCode agent to call them. For example:
+
+```text
+Call openloop_setup with no arguments and show me the available agents and models.
+```
+
+Then configure roles independently:
+
+```text
+Call openloop_setup with coder_agent="build", coder_model="provider/model",
+reviewer_agent="build", and reviewer_model="other-provider/other-model".
+```
+
+Start a goal:
+
+```text
+Call openloop_start_goal with goal="Fix the failing authentication tests and verify the fix."
+```
+
+Monitor or stop it:
+
+```text
+Call openloop_status.
+Call openloop_stop.
+```
+
+The tools are:
+
+- `openloop_setup`: list the live catalog or validate and persist role selections.
+- `openloop_config`: show selections and loop settings.
+- `openloop_start_goal`: start one background loop; a second concurrent start is rejected.
+- `openloop_status`: show running state, phase, round, and final outcome.
+- `openloop_stop`: abort the active worker turn and stop immediately.
+
+Selections are validated again against the live catalog at the start of every goal. Changes made during a run are persisted for the next run; the active run uses a fixed selection snapshot.
+
+## Configuration
+
+OpenLoop reads these process environment variables when the plugin loads:
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `OPENLOOP_CODER_MODEL` | server default | Initial coder `providerID/modelID` selection |
+| `OPENLOOP_CODER_AGENT` | `build` | Initial coder agent |
+| `OPENLOOP_REVIEWER_MODEL` | server default | Initial reviewer `providerID/modelID` selection |
+| `OPENLOOP_REVIEWER_AGENT` | `build` | Initial reviewer agent |
+| `OPENLOOP_MAX_ROUNDS` | `6` | Maximum coder/reviewer rounds |
+| `OPENLOOP_REVIEWER_READONLY` | `true` | Enforce reviewer read-only restrictions |
+| `OPENLOOP_TURN_TIMEOUT_MS` | `1800000` | Per-turn timeout in milliseconds |
+| `OPENLOOP_POLL_INTERVAL_MS` | `2000` | Missed-idle fallback interval |
+
+`.env.example` is a reference only. OpenLoop does not parse `.env` files. For a CLI/server launched from PowerShell, set variables in that process before launch:
+
+```powershell
+$env:OPENLOOP_MAX_ROUNDS = "4"
+opencode
+```
+
+Desktop may not inherit variables set in an already-open shell. Set persistent user environment variables before starting Desktop, or use the defaults and configure agent/model choices through `openloop_setup`.
+
+## Reviewer read-only enforcement
+
+Read-only mode is enforced in two layers:
+
+1. OpenLoop queries the complete live tool catalog before creating either worker session;
+2. the reviewer root session receives persistent deny permissions for editing, shell execution, task/subagent creation, external-directory access, todo writes, and every tool outside a small explicit read-only allowlist (`read`, search/list tools, LSP, and web research tools).
+
+Unknown and plugin-defined tools fail closed. OpenLoop refuses to start read-only mode if OpenCode cannot return its tool catalog. These restrictions are attached once at session creation and OpenLoop deliberately does not pass the legacy per-prompt `tools` map: current OpenCode replaces session permissions when that map is supplied, which would erase other read-only rules. The reviewer receives the exact coder diff in its prompt and can read repository files, but cannot run shell-based tests itself in read-only mode. It reviews the coder's reported test results and code/test changes; the coder remains responsible for executing verification.
+
+These controls limit the impact of ordinary model mistakes and repository prompt injection by preventing reviewer-side mutation. Prompt injection can still distort a model's verdict or suggested follow-up, so repository and diff text are explicitly labelled untrusted and the coder is told to verify every finding. It cannot stop an unrelated external process or another OpenCode session from changing the same working tree concurrently.
+
+## Runtime behavior and recovery
+
+- Every goal gets two fresh root sessions. Old goals cannot contaminate new coder/reviewer context.
+- Each outgoing user message gets an OpenCode-compatible sortable `msg_` ID. Completion is read only from the assistant response whose `parentID` matches that exact message.
+- Session diffs use the coder user-message ID required by OpenCode's diff endpoint, not the assistant-message ID.
+- `session.idle` is the primary completion signal. Status polling recovers a missed event; duplicate events are ignored.
+- A prompt failure, catalog failure, session error, or malformed reviewer verdict ends with an explicit `ERROR`, never a false `PASS`.
+- A missing response or hung turn is aborted at the configured timeout and recorded as a diagnostic `ERROR` (distinct from a user-requested `ABORTED` stop).
+- Provider-managed retries continue when their next attempt fits inside the original turn deadline. A retry scheduled beyond that deadline fails early with the provider's message instead of waiting pointlessly.
+- `openloop_stop` aborts at most once and resolves the loop immediately.
+- Material findings override an inconsistent reviewer `PASS` label. Cosmetic-only low findings do not force another round.
+- Reviewer guidance is wrapped as untrusted input under the authoritative original goal before it reaches the coder.
+
+OpenCode server/Desktop restart does not resume an in-flight loop. After restart, OpenLoop reports no active run; start the goal again and it will create fresh sessions. The state file remains diagnostic history, not an automatic job queue.
+
+## State and privacy
+
+OpenLoop writes:
+
+```text
+.opencode-orchestrator/
+  selections.json
+  state.json
+```
+
+The directory is gitignored. `state.json` contains the goal, worker session IDs, verdict metadata, final outcome/error, reviewer next prompt, and optional research/improvement notes. Do not put secrets in goals or reviewer instructions. Writes use a same-directory temporary file and include a Windows replacement fallback.
+
+## OpenCode APIs used
+
+The implementation uses APIs present in the generated 1.18.23 types and verified against a live 1.18.23 server:
+
+- plugin `event`, `tool`, and `dispose` hooks;
+- `session.create`, `status`, `messages`, `diff`, `abort`, and `promptAsync`;
+- per-prompt `agent`, `model`, and `system`;
+- `client.app.agents()` and `client.config.providers()` active catalogs;
+- `client.tool.ids()` for fail-closed reviewer tool restrictions;
+- assistant text output parsed against the strict reviewer JSON contract, plus compatibility with structured parts and `StructuredOutputError` recovery;
+- `session.idle` and `session.error` events.
+
+No v1 `switchAgent`/`switchModel` calls are mixed into the v2 runtime. No MCP transport is used for worker messaging.
+
+OpenLoop deliberately does not request OpenCode's `json_schema` response format for reviewer turns. In current OpenCode, a formatted turn can complete successfully but subsequently make the session message-list endpoint reject its stored request with `Expected OutputFormatJsonSchema`; this is tracked upstream in [issue #26929](https://github.com/anomalyco/opencode/issues/26929) and [issue #40169](https://github.com/anomalyco/opencode/issues/40169). The reviewer is instead required to return JSON text, which OpenLoop parses and validates. This preserves readable session history and rejects malformed verdicts rather than guessing.
+
+The general `/api/model` endpoint is not used for selection because it is the universal models.dev catalog and can omit configured custom/local providers. `config.providers()` is the server's active configured provider/model view.
+
+## Development and verification
+
+```powershell
+npm install
+npm run build
+npm run typecheck
+npm test
+npm run test:live
+npm audit
+```
+
+To reproduce the exact current-release verification without changing a globally installed CLI:
+
+```powershell
+npm exec --yes --package=opencode-ai@1.18.23 -- npm run test:live
+```
+
+The unit/integration-shaped tests cover PASS, material changes, maximum rounds, malformed output, structured-output fallback, prompt/catalog failures, independent root-session creation, exact diff message binding, dynamic fail-closed read-only enforcement, retry deadlines, persistence failures, timeout, stop, duplicate/missed events, stale restart races, catalog selection, state storage, safe project installation, and the plugin's single-export contract. `test:live` additionally performs the isolated real OpenCode two-round loop described above; it requires `opencode` on `PATH` unless invoked through the exact-version `npm exec` command.
+
+Manual plugin check:
+
+```powershell
+opencode debug config --print-logs --log-level DEBUG
+```
+
+The resolved configuration should contain a file URL ending in:
+
+```text
+.opencode/plugins/openloop.js
+```
+
+If OpenCode reports an error in a global `opencode.json` or `opencode.jsonc`, fix that file first. A syntax error in global configuration prevents project plugin discovery entirely.
+
+## Known limitations
+
+- The npm package is not published; installation copies the generated self-contained plugin into each project.
+- In-flight loops are not resumed after a server/Desktop restart.
+- There is no custom Desktop picker UI; setup is through custom-tool chat interaction.
+- Reviewer read-only mode deliberately disables shell execution, so it cannot independently execute tests.
+- Worker sessions share one working tree. Do not run another writer against that tree during a loop.
+- Model/provider availability, rate limits, authentication, and network failures remain external dependencies and are reported as errors.

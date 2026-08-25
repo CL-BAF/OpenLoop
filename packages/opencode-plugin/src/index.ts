@@ -1,16 +1,21 @@
 import {createOpencodeClient as createClientV2, type OpencodeClient} from "@opencode-ai/sdk/v2";
 import {resolve} from "node:path";
+import {randomBytes} from "node:crypto";
 import type {Plugin, PluginInput, Hooks} from "@opencode-ai/plugin";
 import {tool} from "@opencode-ai/plugin";
 import type {Event} from "@opencode-ai/sdk";
 import {
   type OpenLoopConfig, type LoopOutcome, type DiffSummary,
-  type SessionSelection, type Selections, type Effect,
+  type SessionSelection, type Selections, type Effect, type PersistedState,
   LoopMachine, StateStore, SelectionStore, loadConfig, ConfigError,
-  coderSystemPrompt, reviewerSystemPrompt, REVIEWER_OUTPUT_SCHEMA,
+  coderSystemPrompt, reviewerSystemPrompt,
   log, banner, controlBanner, roundBanner, section,
 } from "@openloop/core";
-import {readLastTurn, readDiff, sessionExists, buildReadonlyTools} from "./sdk.js";
+import {
+  readLastTurn, readDiff, buildReadonlyPermissions, createRootSession,
+  readSessionStatus, abortSession as sdkAbortSession,
+  unwrap, SdkError,
+} from "./sdk.js";
 import {fetchCatalog, validateSelection, formatCatalog, parseModelRef, type Catalog} from "./catalog.js";
 
 export type {Plugin, PluginInput, Hooks};
@@ -20,10 +25,9 @@ const SCOPE = "openloop";
 /**
  * OpenLoop plugin entry point.
  *
- * Register in opencode.json:
- *   { "plugin": ["@openloop/opencode-plugin"] }
- *
- * Or as a local file in .opencode/plugins/openloop.ts that re-exports this.
+ * Development checkouts use the generated self-contained project-local plugin
+ * at .opencode/plugins/openloop.js. A package-name config is valid only after
+ * the package and its dependencies are published.
  *
  * The plugin coordinates two independent root sessions (CODER, REVIEWER) and
  * drives the review/fix loop using the OpenCode SDK + session events.
@@ -43,15 +47,19 @@ export const OpenLoopPlugin: Plugin = async (input: PluginInput) => {
     throw e;
   }
 
-  // Build a v2 SDK client wired to the same server as the plugin, so we can use
-  // structured output (format) for the reviewer verdict. The plugin's own
-  // `input.client` is a v1 client; v2 is needed for `format`.
+  // Build a v2 SDK client wired to the same server as the plugin. The plugin's
+  // input client is the legacy surface and does not expose the current session,
+  // configuration, and catalog endpoints used by the runtime.
   const client: OpencodeClient = createClientV2({
     baseUrl: serverUrl.origin,
     directory,
+    headers: serverAuthHeaders(),
   });
 
-  const runtime = new LoopRuntime(config, client, stateDir, new SelectionStore(stateDir));
+  const runtime = new LoopRuntime(config, client, stateDir, new SelectionStore(stateDir, {
+    coder: {agent: config.coderAgent, model: config.coderModel},
+    reviewer: {agent: config.reviewerAgent, model: config.reviewerModel},
+  }));
 
   const hooks: Hooks = {
     dispose: async () => {
@@ -67,7 +75,7 @@ export const OpenLoopPlugin: Plugin = async (input: PluginInput) => {
     tool: {
       openloop_start_goal: tool({
         description:
-          "Start an OpenLoop coder/reviewer review loop for a goal. The coder session implements/fixes; an independent reviewer inspects and reports findings; the loop repeats until the reviewer passes or max rounds is reached. Returns the final outcome.",
+          "Start a background OpenLoop coder/reviewer loop for a goal. The coder implements/fixes; an independent reviewer inspects and reports findings; the loop repeats until PASS, error, stop, or max rounds. Use openloop_status for the final outcome.",
         args: {
           goal: tool.schema.string().describe("The user's goal for the coder/reviewer loop."),
         },
@@ -83,7 +91,7 @@ export const OpenLoopPlugin: Plugin = async (input: PluginInput) => {
           });
           return {
             title: "OpenLoop started",
-            output: `Started coder/reviewer loop for goal: ${goal}\nThe loop runs in the background. Use openloop_status to check progress.`,
+            output: "Started the coder/reviewer loop in the background. Use openloop_status to check progress and the final outcome.",
           };
         },
       }),
@@ -94,7 +102,7 @@ export const OpenLoopPlugin: Plugin = async (input: PluginInput) => {
           const s = runtime.status();
           return {
             title: "OpenLoop status",
-            output: `running=${s.running} phase=${s.phase} round=${s.round}`,
+            output: `running=${s.running} phase=${s.phase} round=${s.round} outcome=${s.outcome} detail=${s.detail}`,
           };
         },
       }),
@@ -102,8 +110,11 @@ export const OpenLoopPlugin: Plugin = async (input: PluginInput) => {
         description: "Cooperatively stop the running OpenLoop loop (aborts the current busy session).",
         args: {},
         async execute() {
+          if (!runtime.status().running) {
+            return {title: "OpenLoop stop", output: "No OpenLoop run is active."};
+          }
           await runtime.stop();
-          return {title: "OpenLoop stop", output: "Stop requested. The loop will finish its current step then exit."};
+          return {title: "OpenLoop stop", output: "The active turn was aborted and the loop stopped."};
         },
       }),
       openloop_setup: tool({
@@ -135,14 +146,18 @@ export const OpenLoopPlugin: Plugin = async (input: PluginInput) => {
           }
           // Apply new selections.
           const base = current;
+          const coderModel = parseSetupModel(args.coder_model, base.coder.model);
+          if (!coderModel.ok) return {title: "OpenLoop setup", output: `Rejected: coder_model ${coderModel.error}`};
+          const reviewerModel = parseSetupModel(args.reviewer_model, base.reviewer.model);
+          if (!reviewerModel.ok) return {title: "OpenLoop setup", output: `Rejected: reviewer_model ${reviewerModel.error}`};
           const next: Selections = {
             coder: {
               agent: (args.coder_agent ?? base.coder.agent).trim() || base.coder.agent,
-              model: args.coder_model !== undefined ? parseModelRef(args.coder_model) : base.coder.model,
+              model: coderModel.model,
             },
             reviewer: {
               agent: (args.reviewer_agent ?? base.reviewer.agent).trim() || base.reviewer.agent,
-              model: args.reviewer_model !== undefined ? parseModelRef(args.reviewer_model) : base.reviewer.model,
+              model: reviewerModel.model,
             },
           };
           try {
@@ -174,6 +189,13 @@ export const OpenLoopPlugin: Plugin = async (input: PluginInput) => {
   return hooks;
 };
 
+function serverAuthHeaders(): Record<string, string> | undefined {
+  const password = process.env.OPENCODE_SERVER_PASSWORD;
+  if (!password) return undefined;
+  const username = process.env.OPENCODE_SERVER_USERNAME || "opencode";
+  return {Authorization: `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`};
+}
+
 /** Resolve the OpenLoop state directory for a project. */
 function resolveStateDir(projectDir: string): string {
   return resolve(projectDir, ".opencode-orchestrator");
@@ -183,6 +205,17 @@ function resolveStateDir(projectDir: string): string {
 function formatCurrent(s: Selections): string {
   const fmt = (sel: SessionSelection) => `agent=${sel.agent}, model=${sel.model ? `${sel.model.providerID}/${sel.model.modelID}` : "(server default)"}`;
   return `Current selections:\n  coder: ${fmt(s.coder)}\n  reviewer: ${fmt(s.reviewer)}`;
+}
+
+function parseSetupModel(
+  value: string | undefined,
+  current: SessionSelection["model"],
+): {ok: true; model: SessionSelection["model"]} | {ok: false; error: string} {
+  if (value === undefined) return {ok: true, model: current};
+  if (!value.trim()) return {ok: true, model: null};
+  const parsed = parseModelRef(value);
+  if (!parsed) return {ok: false, error: 'must be empty or in the form "providerID/modelID"'};
+  return {ok: true, model: parsed};
 }
 
 /** Convert a v2 SDK error to a thrown Error. */
@@ -196,9 +229,11 @@ class OpenLoopError extends Error {}
  */
 class TurnWatchdog {
   private armed = false;
+  private accepted = false;
   private cancelled = false;
   private timeoutHandle: NodeJS.Timeout | null = null;
   private pollHandle: NodeJS.Timeout | null = null;
+  private deadline: number | null = null;
 
   constructor(private opts: {
     sessionID: string;
@@ -214,11 +249,15 @@ class TurnWatchdog {
   arm(): void {
     if (this.armed || this.cancelled) return;
     this.armed = true;
+    this.deadline ??= Date.now() + this.opts.timeoutMs;
+    const remainingMs = Math.max(0, this.deadline - Date.now());
     this.timeoutHandle = setTimeout(() => {
       if (this.cancelled) return;
       log.warn("watchdog", `timeout fired for ${this.opts.sessionID}`);
-      void this.opts.onTimeout();
-    }, this.opts.timeoutMs);
+      void this.opts.onTimeout().catch((error) => {
+        log.error("watchdog", `timeout handler failed: ${String((error as Error).message ?? error)}`);
+      });
+    }, remainingMs);
     if (this.timeoutHandle.unref) this.timeoutHandle.unref();
     this.pollHandle = setInterval(() => {
       if (this.cancelled) return;
@@ -227,9 +266,12 @@ class TurnWatchdog {
     if (this.pollHandle.unref) this.pollHandle.unref();
   }
 
+  /** Enable status polling after promptAsync has accepted the request. */
+  markAccepted(): void { this.accepted = true; }
+
   private polling = false;
   private async poll(): Promise<void> {
-    if (this.cancelled || !this.armed || this.polling) return;
+    if (this.cancelled || !this.armed || !this.accepted || this.polling) return;
     this.polling = true;
     try {
       const status = await this.opts.readStatus(this.opts.sessionID);
@@ -241,7 +283,9 @@ class TurnWatchdog {
         if (this.pollHandle) { clearInterval(this.pollHandle); this.pollHandle = null; }
         if (this.timeoutHandle) { clearTimeout(this.timeoutHandle); this.timeoutHandle = null; }
         log.debug("watchdog", `poll found ${this.opts.sessionID} idle (missed event)`);
-        void this.opts.onPollIdle();
+        void this.opts.onPollIdle().catch((error) => {
+          log.error("watchdog", `idle recovery failed: ${String((error as Error).message ?? error)}`);
+        });
       }
     } catch (e) {
       log.debug("watchdog", `status poll failed: ${String((e as Error).message ?? e)}`);
@@ -259,6 +303,10 @@ class TurnWatchdog {
   }
 
   isBusy(): boolean { return this.armed && !this.cancelled; }
+
+  remainingMs(): number {
+    return this.deadline === null ? this.opts.timeoutMs : Math.max(0, this.deadline - Date.now());
+  }
 }
 
 /**
@@ -275,13 +323,19 @@ export class LoopRuntime {
   private config: OpenLoopConfig;
   private stateDir: string;
   private selections: SelectionStore;
-  private reviewerTools: Record<string, boolean> | undefined;
+  /** Immutable selection snapshot for the current run. */
+  private activeSelections: Selections | null = null;
   private disposed = false;
   /** Resolves when the loop reaches a STOP effect. */
   private donePromise: Promise<LoopOutcome> | null = null;
   private doneResolve: ((o: LoopOutcome) => void) | null = null;
+  private lastOutcome: LoopOutcome | null = null;
   /** Watchdog for the currently-busy turn (timeout + polling fallback). */
   private watchdog: TurnWatchdog | null = null;
+  private expectedUserMessageID: string | null = null;
+  /** Run token currently consuming an idle/error event, if any. */
+  private consumingTurnToken: number | null = null;
+  private runToken = 0;
 
   constructor(config: OpenLoopConfig, client: OpencodeClient, stateDir: string, selections: SelectionStore) {
     this.config = config;
@@ -292,20 +346,12 @@ export class LoopRuntime {
 
   /** Resolve the effective coder selection (persisted or config fallback). */
   private coderSelection(): SessionSelection {
-    const s = this.selections.coder;
-    return {
-      agent: s.agent || this.config.coderAgent,
-      model: s.model ?? this.config.coderModel,
-    };
+    return this.activeSelections?.coder ?? this.selections.coder;
   }
 
   /** Resolve the effective reviewer selection (persisted or config fallback). */
   private reviewerSelection(): SessionSelection {
-    const s = this.selections.reviewer;
-    return {
-      agent: s.agent || this.config.reviewerAgent,
-      model: s.model ?? this.config.reviewerModel,
-    };
+    return this.activeSelections?.reviewer ?? this.selections.reviewer;
   }
 
   /** Return current persisted selections (for the setup/config tools). */
@@ -320,8 +366,15 @@ export class LoopRuntime {
     if (!coderV.ok) return {ok: false, error: `coder: ${coderV.error}`};
     const reviewerV = validateSelection(next.reviewer, catalog);
     if (!reviewerV.ok) return {ok: false, error: `reviewer: ${reviewerV.error}`};
+    const previous = this.selections.snapshot();
     this.selections.replaceAll({coder: coderV.selection, reviewer: reviewerV.selection});
-    this.selections.flush();
+    try {
+      this.selections.flush();
+    } catch (error) {
+      // A rejected setup must not become the runtime's in-memory selection.
+      this.selections.restore(previous);
+      throw error;
+    }
     return {ok: true};
   }
 
@@ -332,66 +385,100 @@ export class LoopRuntime {
 
   /** Start a new loop for a goal. Resolves with the final outcome. */
   async start(goal: string): Promise<LoopOutcome> {
+    if (this.disposed) return {kind: "ERROR", rounds: 0, error: "plugin is disposed"};
     if (this.machine) {
       log.warn(SCOPE, "loop already running; ignoring start");
       return {kind: "ERROR", rounds: this.machine.round, error: "loop already running"};
     }
     const store = new StateStore(this.stateDir, goal);
     this.store = store;
-    this.machine = new LoopMachine(this.config, store.snapshot());
-    this.donePromise = new Promise((resolve) => { this.doneResolve = resolve; });
+    const machine = new LoopMachine(this.config, store.snapshot());
+    this.machine = machine;
+    const token = ++this.runToken;
+    const donePromise = new Promise<LoopOutcome>((resolve) => { this.doneResolve = resolve; });
+    this.donePromise = donePromise;
+    this.lastOutcome = null;
 
     banner(`OpenLoop starting (max rounds: ${this.config.maxRounds})`);
-    log.info(SCOPE, `goal: ${goal}`);
+    log.info(SCOPE, `goal accepted (${goal.length} characters)`);
 
     try {
-      await this.ensureSessions();
-      store.setCoderSessionID(this.machine.coderSessionID);
-      store.setReviewerSessionID(this.machine.reviewerSessionID);
-      store.flush();
-
-      const effect = this.machine.start(goal);
-      await this.dispatch(effect);
+      const effect = machine.start(goal);
+      machine.setCoderSessionID(null);
+      machine.setReviewerSessionID(null);
+      const selectionResult = await Promise.race([
+        this.validateSelectionsForStart().then((value) => ({type: "ready" as const, value})),
+        donePromise.then((outcome) => ({type: "done" as const, outcome})),
+      ]);
+      if (selectionResult.type === "done") return selectionResult.outcome;
+      const selections = selectionResult.value;
+      if (!this.isCurrentRun(token, machine)) return await donePromise;
+      this.activeSelections = selections;
+      const sessionResult = await Promise.race([
+        this.createSessions(token, machine).then(() => ({type: "ready" as const})),
+        donePromise.then((outcome) => ({type: "done" as const, outcome})),
+      ]);
+      if (sessionResult.type === "done") return sessionResult.outcome;
+      if (!this.isCurrentRun(token, machine)) return await donePromise;
+      this.persistMachineBestEffort("initial session state");
+      await this.dispatch(effect, token, machine);
     } catch (e) {
+      if (!this.ownsRun(token, machine)) return await donePromise;
       // F4: cleanup on failed start so the runtime is reusable.
       const msg = e instanceof Error ? e.message : String(e);
       log.error(SCOPE, `start failed: ${msg}`);
-      this.finish({kind: "ERROR", rounds: 0, error: msg});
+      this.finish({kind: "ERROR", rounds: 0, error: msg}, token, machine);
     }
-    return (await this.donePromise) ?? {kind: "ERROR", rounds: 0, error: "loop ended unexpectedly"};
+    return await donePromise;
   }
 
   /** Current status for external observation (future MCP adapter). */
-  status(): {running: boolean; phase: string; round: number} {
+  status(): {running: boolean; phase: string; round: number; outcome: string; detail: string} {
+    const outcome = this.lastOutcome;
     return {
       running: this.machine !== null && this.machine.phase !== "DONE",
       phase: this.machine?.phase ?? "IDLE",
-      round: this.machine?.round ?? 0,
+      round: this.machine?.round ?? outcome?.rounds ?? 0,
+      outcome: outcome?.kind ?? "NONE",
+      detail: formatOutcomeDetail(outcome),
     };
   }
 
   /** Stop the loop (cooperative). */
   async stop(): Promise<void> {
     if (!this.machine) return;
-    const effect = this.machine.abort();
+    const machine = this.machine;
+    const token = this.runToken;
+    this.watchdog?.cancel();
+    const effect = machine.abort();
     if (effect.type === "ABORT") {
-      // Abort the busy session; the idle event (or watchdog) will drive STOP.
-      await this.abortSession(effect.sessionID);
-    } else if (effect.type === "STOP") {
-      this.finish(effect.outcome);
+      // The server may be unreachable. Issue the remote cancellation once but
+      // never let its HTTP response gate the local stop contract.
+      void this.abortSession(effect.sessionID);
+      if (!this.ownsRun(token, machine)) return;
+      const stopped = machine.abort();
+      if (stopped.type === "STOP") this.finish(stopped.outcome, token, machine);
+      return;
     }
+    if (effect.type === "STOP") this.finish(effect.outcome, token, machine);
   }
 
   async dispose(): Promise<void> {
     this.disposed = true;
     await this.stop();
     this.watchdog?.cancel();
-    this.store?.flush();
+    try {
+      this.store?.flush();
+    } catch (error) {
+      log.error(SCOPE, `failed to flush state during dispose: ${String((error as Error).message ?? error)}`);
+    }
   }
 
   /** Handle a session event from the plugin's event hook. */
   async handleEvent(event: Event): Promise<void> {
     if (!this.machine || this.machine.phase === "DONE") return;
+    const machine = this.machine;
+    const token = this.runToken;
 
     if (event.type === "session.idle") {
       const idleID = event.properties.sessionID;
@@ -400,6 +487,18 @@ export class LoopRuntime {
       if (idleID !== waitingOn) return;
       if (!this.watchdog || !this.watchdog.isBusy()) return;
       await this.onWaitingSessionIdle();
+    } else if (event.type === "session.status") {
+      const {sessionID, status} = event.properties;
+      if (sessionID !== this.waitingSessionID() || status.type !== "retry" || !this.watchdog?.isBusy()) return;
+      const waitMs = Math.max(0, status.next - Date.now());
+      if (waitMs >= this.watchdog.remainingMs()) {
+        await this.failActiveTurn(
+          "RetryDeadlineExceeded",
+          `OpenCode retry cannot occur before the ${this.config.turnTimeoutMs}ms turn deadline: ${status.message}`,
+        );
+      } else {
+        log.warn(SCOPE, `OpenCode is retrying ${sessionID} (attempt ${status.attempt}): ${status.message}`);
+      }
     } else if (event.type === "session.error") {
       const errSession = event.properties.sessionID;
       if (!errSession) return;
@@ -407,12 +506,35 @@ export class LoopRuntime {
       const waitingOn = this.waitingSessionID();
       if (errSession !== waitingOn || !this.watchdog || !this.watchdog.isBusy()) return;
       log.error(SCOPE, `session error event for ${errSession}`);
+      // The plugin hook currently exposes a v1 Event union while the v2
+      // assistant API can report StructuredOutputError. Inspect the runtime
+      // name without relying on the narrower generated v1 discriminant.
+      const eventError: unknown = event.properties.error;
+      const eventErrorName = runtimeErrorName(eventError);
+      // Structured-output failures can still persist useful JSON in the
+      // matching assistant text. Read that turn instead of discarding it.
+      if (eventErrorName === "StructuredOutputError") {
+        await this.onWaitingSessionIdle();
+        return;
+      }
       this.watchdog.cancel();
-      const errTurn = {messageID: "", text: "", structured: null, error: {name: "SessionError", message: "session error event"}};
-      const effect = this.machine.phase === "REVIEWER_RUNNING"
-        ? this.machine.onReviewerTurn(errTurn)
-        : this.machine.onCoderTurn(errTurn);
-      await this.dispatch(effect);
+      const errTurn = {
+        messageID: "",
+        parentMessageID: this.expectedUserMessageID ?? "",
+        text: "",
+        structured: null,
+        error: {
+          name: eventErrorName ?? "SessionError",
+          message: eventError && typeof eventError === "object" && "data" in eventError
+            ? String((eventError.data as {message?: string}).message ?? eventErrorName)
+            : "session error event",
+        },
+      };
+      if (!this.isCurrentRun(token, machine)) return;
+      const effect = machine.phase === "REVIEWER_RUNNING"
+        ? machine.onReviewerTurn(errTurn)
+        : machine.onCoderTurn(errTurn);
+      await this.dispatch(effect, token, machine);
     }
   }
 
@@ -426,73 +548,106 @@ export class LoopRuntime {
   /** Called when the session we're waiting on goes idle (turn done). */
   private async onWaitingSessionIdle(): Promise<void> {
     if (!this.machine) return;
+    const machine = this.machine;
+    const token = this.runToken;
+    if (this.consumingTurnToken === token) return;
     const sessionID = this.waitingSessionID();
     if (!sessionID) return;
-    // Cancel the watchdog before reading the turn so the timeout/poll can't fire concurrently.
-    this.watchdog?.cancel();
+    const parentMessageID = this.expectedUserMessageID ?? undefined;
+    const watchdog = this.watchdog;
+    this.consumingTurnToken = token;
     try {
-      const turn = await readLastTurn(this.client, sessionID);
-      const effect = this.machine.phase === "REVIEWER_RUNNING"
-        ? this.machine.onReviewerTurn(turn)
-        : this.machine.onCoderTurn(turn);
-      await this.dispatch(effect);
+      const turn = await readLastTurn(this.client, sessionID, parentMessageID);
+      if (!this.isCurrentRun(token, machine)
+        || this.waitingSessionID() !== sessionID
+        || this.expectedUserMessageID !== parentMessageID
+        || this.watchdog !== watchdog) return;
+      watchdog?.cancel();
+      this.expectedUserMessageID = null;
+      const effect = machine.phase === "REVIEWER_RUNNING"
+        ? machine.onReviewerTurn(turn)
+        : machine.onCoderTurn(turn);
+      await this.dispatch(effect, token, machine);
     } catch (e) {
+      if (e instanceof SdkError && e.code === "TurnNotReady") {
+        if (this.isCurrentRun(token, machine)
+          && this.waitingSessionID() === sessionID
+          && this.expectedUserMessageID === parentMessageID
+          && this.watchdog === watchdog) watchdog?.arm();
+        return;
+      }
+      if (!this.isCurrentRun(token, machine)) return;
+      this.watchdog?.cancel();
+      this.expectedUserMessageID = null;
       log.error(SCOPE, `failed to read turn for ${sessionID}: ${String((e as Error).message ?? e)}`);
-      const errTurn = {messageID: "", text: "", structured: null, error: {name: "ReadError", message: String((e as Error).message ?? e)}};
-      const effect = this.machine.phase === "REVIEWER_RUNNING"
-        ? this.machine.onReviewerTurn(errTurn)
-        : this.machine.onCoderTurn(errTurn);
-      await this.dispatch(effect);
+      const errTurn = {
+        messageID: "",
+        parentMessageID: parentMessageID ?? "",
+        text: "",
+        structured: null,
+        error: {name: "ReadError", message: String((e as Error).message ?? e)},
+      };
+      const effect = machine.phase === "REVIEWER_RUNNING"
+        ? machine.onReviewerTurn(errTurn)
+        : machine.onCoderTurn(errTurn);
+      await this.dispatch(effect, token, machine);
+    } finally {
+      if (this.consumingTurnToken === token) this.consumingTurnToken = null;
     }
   }
 
   /** Interpret an Effect returned by the machine. */
-  private async dispatch(effect: Effect): Promise<void> {
+  private async dispatch(effect: Effect, token: number, machine: LoopMachine): Promise<void> {
+    if (!this.ownsRun(token, machine)) return;
+    this.persistMachineBestEffort(`transition ${effect.type}`);
     if (this.disposed && effect.type !== "STOP") return;
     switch (effect.type) {
       case "SEND_CODER": {
         roundBanner(effect.round, this.config.maxRounds);
         controlBanner("CODER", effect.round === 1 ? "initial implementation" : "fix reviewer findings");
         const sel = this.coderSelection();
-        await this.sendAndWatch(this.machine!.coderSessionID!, effect.prompt, {
+        await this.sendAndWatch(machine.coderSessionID!, effect.prompt, {
           model: sel.model,
           agent: sel.agent,
           system: coderSystemPrompt(),
-        });
+        }, token, machine);
         return;
       }
       case "SEND_REVIEWER": {
         controlBanner("REVIEWER", `inspect round ${effect.round}`);
         const sel = this.reviewerSelection();
-        await this.sendAndWatch(this.machine!.reviewerSessionID!, effect.prompt, {
+        await this.sendAndWatch(machine.reviewerSessionID!, effect.prompt, {
           model: sel.model,
           agent: sel.agent,
           system: reviewerSystemPrompt(),
-          tools: this.reviewerTools,
-          format: {type: "json_schema", schema: REVIEWER_OUTPUT_SCHEMA as unknown as Record<string, unknown>, retryCount: 2},
-        });
+        }, token, machine);
         return;
       }
       case "FETCH_DIFF": {
         try {
           const diff = await readDiff(this.client, effect.sessionID, effect.messageID);
+          if (!this.isCurrentRun(token, machine)) return;
           logDiff(diff);
-          await this.dispatch(this.machine!.onDiff(diff));
+          await this.dispatch(machine.onDiff(diff), token, machine);
         } catch (e) {
+          if (!this.isCurrentRun(token, machine)) return;
           log.warn(SCOPE, `diff fetch failed: ${String((e as Error).message ?? e)}`);
-          await this.dispatch(this.machine!.onDiff(null));
+          await this.dispatch(machine.onDiff(null), token, machine);
         }
         return;
       }
       case "ABORT": {
         // F1: abort the session, then drive STOP via the machine (machine.abort()
         // is idempotent — a second call returns STOP). Do not re-dispatch ABORT.
-        await this.abortSession(effect.sessionID);
-        await this.dispatch(this.machine!.abort());
+        // Remote abort is best-effort: a dead server must not defeat the local
+        // turn deadline or leave the runtime permanently wedged.
+        void this.abortSession(effect.sessionID);
+        if (!this.ownsRun(token, machine)) return;
+        await this.dispatch(machine.abort(), token, machine);
         return;
       }
       case "STOP": {
-        this.finish(effect.outcome);
+        this.finish(effect.outcome, token, machine);
         return;
       }
     }
@@ -510,160 +665,310 @@ export class LoopRuntime {
       model: OpenLoopConfig["coderModel"];
       agent: string;
       system?: string;
-      tools?: Record<string, boolean>;
-      format?: {type: "json_schema"; schema: Record<string, unknown>; retryCount?: number};
     },
+    token: number,
+    machine: LoopMachine,
   ): Promise<void> {
-    const phase = this.machine!.phase as "CODER_RUNNING" | "REVIEWER_RUNNING";
-    this.watchdog = new TurnWatchdog({
+    if (!this.isCurrentRun(token, machine)) return;
+    const phase = machine.phase as "CODER_RUNNING" | "REVIEWER_RUNNING";
+    let status: string;
+    try {
+      status = await readSessionStatus(this.client, sessionID);
+    } catch (error) {
+      if (!this.isCurrentRun(token, machine)) return;
+      const effect = phase === "REVIEWER_RUNNING"
+        ? machine.onReviewerTurn(turnError("StatusError", String((error as Error).message ?? error)))
+        : machine.onCoderTurn(turnError("StatusError", String((error as Error).message ?? error)));
+      await this.dispatch(effect, token, machine);
+      return;
+    }
+    if (!this.isCurrentRun(token, machine) || this.waitingSessionID() !== sessionID) return;
+    if (status === "busy" || status === "retry") {
+      const errTurn = turnError("BusySession", `session ${sessionID} is ${status}; refusing to overlap prompts`);
+      const effect = phase === "REVIEWER_RUNNING"
+        ? machine.onReviewerTurn(errTurn)
+        : machine.onCoderTurn(errTurn);
+      await this.dispatch(effect, token, machine);
+      return;
+    }
+    const userMessageID = createMessageID();
+    this.expectedUserMessageID = userMessageID;
+    const watchdog = new TurnWatchdog({
       sessionID,
       phase,
       timeoutMs: this.config.turnTimeoutMs,
       pollIntervalMs: this.config.pollIntervalMs,
       onTimeout: async () => {
+        if (!this.isCurrentRun(token, machine)
+          || this.waitingSessionID() !== sessionID
+          || this.expectedUserMessageID !== userMessageID
+          || this.watchdog !== watchdog) return;
         log.warn(SCOPE, `turn timeout for ${sessionID} after ${this.config.turnTimeoutMs}ms; aborting`);
-        await this.abortSession(sessionID);
-        const effect = this.machine!.abort();
-        await this.dispatch(effect);
+        await this.failActiveTurn(
+          "TimeoutError",
+          `session ${sessionID} exceeded the ${this.config.turnTimeoutMs}ms turn timeout`,
+        );
       },
       onPollIdle: async () => {
+        if (!this.isCurrentRun(token, machine)
+          || this.waitingSessionID() !== sessionID
+          || this.expectedUserMessageID !== userMessageID
+          || this.watchdog !== watchdog) return;
         log.debug(SCOPE, `poll detected idle for ${sessionID} (missed event); recovering`);
         await this.onWaitingSessionIdle();
       },
       readStatus: async (id) => {
-        const map = await this.client.session.status().then((r) => r.data ?? {}).catch(() => ({} as Record<string, unknown>));
-        return (map as Record<string, {type?: string}>)[id]?.type ?? null;
+        return readSessionStatus(this.client, id);
       },
     });
+    this.watchdog = watchdog;
+    // Arm before sending so a very fast idle event cannot be lost. Polling is
+    // held until promptAsync acknowledges the request.
+    watchdog.arm();
     try {
-      await this.sendPrompt(sessionID, text, opts);
-      this.watchdog.arm();
+      await this.sendPrompt(sessionID, userMessageID, text, opts);
+      if (!this.isExactTurn(token, machine, phase, sessionID, userMessageID, watchdog)) return;
+      watchdog.markAccepted();
     } catch (e) {
-      this.watchdog.cancel();
+      if (!this.isExactTurn(token, machine, phase, sessionID, userMessageID, watchdog)) return;
+      watchdog.cancel();
       this.watchdog = null;
+      this.expectedUserMessageID = null;
       const msg = e instanceof Error ? e.message : String(e);
-      const effect = this.machine!.abort();
-      await this.dispatch(effect);
-      throw new OpenLoopError(`sendPrompt failed: ${msg}`);
+      const errTurn = turnError("PromptError", msg, userMessageID);
+      const effect = phase === "REVIEWER_RUNNING"
+        ? machine.onReviewerTurn(errTurn)
+        : machine.onCoderTurn(errTurn);
+      await this.dispatch(effect, token, machine);
     }
+  }
+
+  /** Abort the remote turn and finish locally with a diagnostic ERROR. */
+  private async failActiveTurn(name: string, message: string): Promise<void> {
+    const machine = this.machine;
+    if (!machine || machine.phase === "DONE") return;
+    const token = this.runToken;
+    const sessionID = this.waitingSessionID();
+    if (!sessionID) return;
+    const phase = machine.phase;
+    this.watchdog?.cancel();
+    this.watchdog = null;
+    this.expectedUserMessageID = null;
+    void this.abortSession(sessionID);
+    if (!this.isCurrentRun(token, machine)) return;
+    const turn = turnError(name, message);
+    const effect = phase === "REVIEWER_RUNNING"
+      ? machine.onReviewerTurn(turn)
+      : machine.onCoderTurn(turn);
+    await this.dispatch(effect, token, machine);
   }
 
   /** Send a prompt asynchronously and let the event hook + watchdog observe idle. */
   private async sendPrompt(
     sessionID: string,
+    messageID: string,
     text: string,
     opts: {
       model: OpenLoopConfig["coderModel"];
       agent: string;
       system?: string;
-      tools?: Record<string, boolean>;
-      format?: {type: "json_schema"; schema: Record<string, unknown>; retryCount?: number};
     },
   ): Promise<void> {
-    // Refuse to send if the session is already busy (protection).
-    const statusMap = await this.client.session.status().then((r) => r.data ?? {}).catch(() => ({} as Record<string, unknown>));
-    const status = (statusMap as Record<string, {type?: string}>)[sessionID];
-    if (status?.type === "busy") {
-      throw new OpenLoopError(`session ${sessionID} is busy; refusing to send a new prompt`);
-    }
-    const res = await this.client.session.promptAsync({
+    await unwrap(this.client.session.promptAsync({
       sessionID,
+      messageID,
       parts: [{type: "text", text}],
       model: opts.model ? {providerID: opts.model.providerID, modelID: opts.model.modelID} : undefined,
       agent: opts.agent,
       system: opts.system,
-      tools: opts.tools,
-      format: opts.format,
-    });
-    if (res.error) throw new OpenLoopError(`prompt failed: ${String((res.error as {name?: string}).name ?? "unknown")}`);
+    }), `prompt session ${sessionID}`, true);
   }
 
-  /** Ensure both independent root sessions exist (create or resume). */
-  private async ensureSessions(): Promise<void> {
-    const machine = this.machine!;
-    const store = this.store!;
-
-    let coderID = store.coderSessionID;
-    if (coderID) {
-      if (await sessionExists(this.client, coderID)) {
-        log.info(SCOPE, `resumed coder session ${coderID}`);
-      } else {
-        log.warn(SCOPE, `stored coder session ${coderID} not found; creating new`);
-        coderID = null;
+  /** Create two fresh, independent root sessions for this run. */
+  private async createSessions(token: number, machine: LoopMachine): Promise<void> {
+    const createdIDs: string[] = [];
+    try {
+      const reviewerPermissions = this.config.reviewerReadonly
+        ? await buildReadonlyPermissions(this.client)
+        : undefined;
+      if (!this.isCurrentRun(token, machine)) return;
+      const coder = await createRootSession(this.client, "CODER (openloop)");
+      createdIDs.push(coder.id);
+      if (!this.isCurrentRun(token, machine)) {
+        await this.cleanupSessions(createdIDs);
+        return;
       }
-    }
-    if (!coderID) {
-      const s = await this.client.session.create({title: "CODER (openloop)"}).then((r) => r.data).catch((e) => { throw new OpenLoopError(`create coder session: ${String((e as Error).message ?? e)}`); });
-      coderID = s!.id;
-      log.info(SCOPE, `created coder session ${coderID}`);
-    }
-    machine.setCoderSessionID(coderID);
-    store.setCoderSessionID(coderID);
-    // Coder agent+model are applied per-turn via promptAsync (see sendAndWatch),
-    // not via switchAgent/switchModel, to avoid v1/v2 session API mismatch.
-
-    // Reviewer: independent root session, NEVER a child of coder (no parentID).
-    let reviewerID = store.reviewerSessionID;
-    if (reviewerID) {
-      if (await sessionExists(this.client, reviewerID)) {
-        log.info(SCOPE, `resumed reviewer session ${reviewerID}`);
-      } else {
-        log.warn(SCOPE, `stored reviewer session ${reviewerID} not found; creating new`);
-        reviewerID = null;
+      const reviewer = await createRootSession(
+        this.client,
+        "REVIEWER (openloop)",
+        reviewerPermissions,
+      );
+      createdIDs.push(reviewer.id);
+      if (!this.isCurrentRun(token, machine)) {
+        await this.cleanupSessions(createdIDs);
+        return;
       }
-    }
-    if (!reviewerID) {
-      const s = await this.client.session.create({title: "REVIEWER (openloop)"}).then((r) => r.data).catch((e) => { throw new OpenLoopError(`create reviewer session: ${String((e as Error).message ?? e)}`); });
-      reviewerID = s!.id;
-      log.info(SCOPE, `created reviewer session ${reviewerID}`);
-    }
-    machine.setReviewerSessionID(reviewerID);
-    store.setReviewerSessionID(reviewerID);
-
-    if (this.config.reviewerReadonly) {
-      this.reviewerTools = await buildReadonlyTools(this.client).catch((e) => {
-        log.warn(SCOPE, `could not build readonly tools: ${String((e as Error).message ?? e)}; relying on system prompt`);
-        return undefined;
-      });
-      if (this.reviewerTools) {
-        log.info(SCOPE, `reviewer readonly: disabled ${Object.keys(this.reviewerTools).join(", ")}`);
+      if (coder.id === reviewer.id) {
+        throw new OpenLoopError(`OpenCode returned the same session ID for coder and reviewer: ${coder.id}`);
       }
+      machine.setCoderSessionID(coder.id);
+      machine.setReviewerSessionID(reviewer.id);
+      log.info(SCOPE, `created independent root sessions coder=${coder.id} reviewer=${reviewer.id}`);
+
+      if (reviewerPermissions) {
+        const denied = reviewerPermissions.map((rule) => rule.permission);
+        log.info(SCOPE, `reviewer readonly: denied ${denied.join(", ")}`);
+      }
+    } catch (error) {
+      await this.cleanupSessions(createdIDs);
+      throw error;
     }
+  }
+
+  /** Best-effort cleanup for roots created during a setup that did not start. */
+  private async cleanupSessions(sessionIDs: string[]): Promise<void> {
+    await Promise.all([...new Set(sessionIDs)].map(async (sessionID) => {
+      await this.abortSession(sessionID);
+      try {
+        await unwrap(this.client.session.delete({sessionID}), `delete session ${sessionID}`);
+      } catch (error) {
+        log.warn(SCOPE, `delete failed for unused session ${sessionID}: ${String((error as Error).message ?? error)}`);
+      }
+    }));
   }
 
   /** Abort a session, ignoring errors. */
   private async abortSession(sessionID: string): Promise<void> {
     try {
-      await this.client.session.abort({sessionID});
+      await sdkAbortSession(this.client, sessionID);
     } catch (e) {
       log.warn(SCOPE, `abort failed for ${sessionID}: ${String((e as Error).message ?? e)}`);
     }
   }
 
-  private finish(outcome: LoopOutcome): void {
+  private finish(outcome: LoopOutcome, token: number, machine: LoopMachine): void {
+    if (!this.ownsRun(token, machine)) return;
     this.watchdog?.cancel();
     this.watchdog = null;
-    if (this.machine) this.machine.phase = "DONE";
-    this.store?.flush();
-    switch (outcome.kind) {
-      case "PASS":
-        banner(`OpenLoop PASS after ${outcome.rounds} round${outcome.rounds === 1 ? "" : "s"}`);
-        if (outcome.finalSummary) section(`Final: ${outcome.finalSummary}`);
-        break;
-      case "MAX_ROUNDS":
-        banner(`OpenLoop stopped at max rounds (${outcome.rounds})`);
-        if (outcome.finalSummary) section(`Last: ${outcome.finalSummary}`);
-        break;
-      case "ABORTED":
-        banner(`OpenLoop aborted after ${outcome.rounds} round${outcome.rounds === 1 ? "" : "s"}`);
-        break;
-      case "ERROR":
-        log.error(SCOPE, `OpenLoop failed after ${outcome.rounds} round(s): ${outcome.error}`);
-        break;
+    machine.phase = "DONE";
+    this.lastOutcome = outcome;
+    try {
+      // State is diagnostic at this point. A locked/full disk must not leave the
+      // runtime permanently wedged in a completed-but-still-owned run.
+      try {
+        this.persistMachine();
+      } catch (error) {
+        log.error(SCOPE, `failed to persist final state: ${String((error as Error).message ?? error)}`);
+      }
+      switch (outcome.kind) {
+        case "PASS":
+          banner(`OpenLoop PASS after ${outcome.rounds} round${outcome.rounds === 1 ? "" : "s"}`);
+          if (outcome.finalSummary) section(`Final: ${outcome.finalSummary}`);
+          break;
+        case "MAX_ROUNDS":
+          banner(`OpenLoop stopped at max rounds (${outcome.rounds})`);
+          if (outcome.finalSummary) section(`Last: ${outcome.finalSummary}`);
+          break;
+        case "ABORTED":
+          banner(`OpenLoop aborted after ${outcome.rounds} round${outcome.rounds === 1 ? "" : "s"}`);
+          break;
+        case "ERROR":
+          log.error(SCOPE, `OpenLoop failed after ${outcome.rounds} round(s): ${outcome.error}`);
+          break;
+      }
+    } finally {
+      this.doneResolve?.(outcome);
+      this.doneResolve = null;
+      this.machine = null;
+      this.runToken += 1;
+      this.activeSelections = null;
+      this.expectedUserMessageID = null;
+      this.consumingTurnToken = null;
     }
-    this.doneResolve?.(outcome);
-    this.machine = null;
   }
+
+  private persistMachine(): void {
+    if (!this.machine || !this.store) return;
+    this.store.replaceFrom(this.machine.snapshot() as PersistedState);
+    this.store.flush();
+  }
+
+  private persistMachineBestEffort(context: string): void {
+    try {
+      this.persistMachine();
+    } catch (error) {
+      log.error(SCOPE, `failed to persist ${context}: ${String((error as Error).message ?? error)}`);
+    }
+  }
+
+  private async validateSelectionsForStart(): Promise<Selections> {
+    const catalog = await this.getCatalog();
+    const current = this.selections.snapshot();
+    const coder = validateSelection(current.coder, catalog);
+    if (!coder.ok) throw new OpenLoopError(`coder selection invalid: ${coder.error}`);
+    const reviewer = validateSelection(current.reviewer, catalog);
+    if (!reviewer.ok) throw new OpenLoopError(`reviewer selection invalid: ${reviewer.error}`);
+    return {coder: coder.selection, reviewer: reviewer.selection};
+  }
+
+  private ownsRun(token: number, machine: LoopMachine): boolean {
+    return token === this.runToken && this.machine === machine;
+  }
+
+  private isCurrentRun(token: number, machine: LoopMachine): boolean {
+    return this.ownsRun(token, machine) && machine.phase !== "DONE";
+  }
+
+  private isExactTurn(
+    token: number,
+    machine: LoopMachine,
+    phase: "CODER_RUNNING" | "REVIEWER_RUNNING",
+    sessionID: string,
+    userMessageID: string,
+    watchdog: TurnWatchdog,
+  ): boolean {
+    return this.isCurrentRun(token, machine)
+      && machine.phase === phase
+      && this.waitingSessionID() === sessionID
+      && this.expectedUserMessageID === userMessageID
+      && this.watchdog === watchdog;
+  }
+}
+
+function turnError(name: string, message: string, parentMessageID = "") {
+  return {messageID: "", parentMessageID, text: "", structured: null, error: {name, message}};
+}
+
+function runtimeErrorName(error: unknown): string | undefined {
+  if (!error || typeof error !== "object" || !("name" in error)) return undefined;
+  return typeof error.name === "string" ? error.name : undefined;
+}
+
+function formatOutcomeDetail(outcome: LoopOutcome | null): string {
+  if (!outcome) return "none";
+  if (outcome.kind === "ERROR") return outcome.error;
+  if (outcome.kind === "PASS" || outcome.kind === "MAX_ROUNDS") return outcome.finalSummary || outcome.kind;
+  return "stopped by request";
+}
+
+let lastMessageTimestamp = 0;
+let messageCounter = 0;
+const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/** Generate the same sortable msg_ identifier shape used by OpenCode. */
+function createMessageID(): string {
+  const timestamp = Date.now();
+  if (timestamp !== lastMessageTimestamp) {
+    lastMessageTimestamp = timestamp;
+    messageCounter = 0;
+  }
+  messageCounter += 1;
+  const encoded = BigInt(timestamp) * 0x1000n + BigInt(messageCounter);
+  const time = encoded.toString(16).padStart(12, "0").slice(-12);
+  const bytes = randomBytes(14);
+  let suffix = "";
+  for (const byte of bytes) suffix += BASE62[byte % BASE62.length];
+  return `msg_${time}${suffix}`;
 }
 
 function logDiff(diff: DiffSummary | null): void {

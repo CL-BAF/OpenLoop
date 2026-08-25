@@ -17,8 +17,8 @@
   },
   "dependencies": {
     "@openloop/core": "^1.0.0",
-    "@opencode-ai/plugin": "^1.18.22",
-    "@opencode-ai/sdk": "^1.18.22"
+    "@opencode-ai/plugin": "^1.18.23",
+    "@opencode-ai/sdk": "^1.18.23"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

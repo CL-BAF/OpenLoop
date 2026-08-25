@@ -92,6 +92,8 @@ export interface DiffSummary {
 /** Result of a completed agent turn. */
 export interface TurnResult {
   messageID: string;
+  /** User message that this assistant response answers. */
+  parentMessageID?: string;
   /** Concatenated assistant text output. */
   text: string;
   /** Structured output if the server returned one (reviewer verdict). */
@@ -138,5 +140,7 @@ export interface PersistedState {
   coderSessionID: string | null;
   reviewerSessionID: string | null;
   rounds: RoundRecord[];
+  /** Final outcome for the most recently completed run, or null while active. */
+  outcome: LoopOutcome | null;
   lastUpdated: number;
 }
