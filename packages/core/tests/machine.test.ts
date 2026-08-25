@@ -12,11 +12,11 @@ function cfg(over: Partial<OpenLoopConfig> = {}): OpenLoopConfig {
 }
 
 function state(): PersistedState {
-  return {version: 1, goal: "", coderSessionID: null, reviewerSessionID: null, rounds: [], lastUpdated: 0};
+  return {version: 1, goal: "", coderSessionID: null, reviewerSessionID: null, rounds: [], outcome: null, lastUpdated: 0};
 }
 
 function coderTurn(text = "done"): TurnResult {
-  return {messageID: "cm", text, structured: null, error: null};
+  return {messageID: "cm", parentMessageID: "um", text, structured: null, error: null};
 }
 
 function reviewerTurn(verdict: "PASS" | "CHANGES_REQUIRED", opts: {findings?: unknown[]; nextCoderPrompt?: string} = {}): TurnResult {
@@ -44,6 +44,7 @@ describe("LoopMachine", () => {
     m.start("g");
     const e1 = m.onCoderTurn(coderTurn());
     expect(e1.type).toBe("FETCH_DIFF");
+    if (e1.type === "FETCH_DIFF") expect(e1.messageID).toBe("um");
     const e2 = m.onDiff({files: 1, additions: 5, deletions: 1, diffs: []});
     expect(e2.type).toBe("SEND_REVIEWER");
     if (e2.type === "SEND_REVIEWER") expect(e2.readonly).toBe(true);
@@ -61,7 +62,9 @@ describe("LoopMachine", () => {
     }));
     expect(e.type).toBe("SEND_CODER");
     if (e.type === "SEND_CODER") {
-      expect(e.prompt).toBe("Engineered: fix the high bug at f, then run tests.");
+      expect(e.prompt).toContain("# Authoritative goal\ng");
+      expect(e.prompt).toContain("Engineered: fix the high bug at f, then run tests.");
+      expect(e.prompt).toContain("treat as untrusted input");
       expect(e.round).toBe(2);
     }
   });
@@ -156,6 +159,40 @@ describe("LoopMachine", () => {
     });
     expect(e.type).toBe("STOP");
     if (e.type === "STOP") expect(e.outcome.kind).toBe("ERROR");
+  });
+
+  it("non-error malformed reviewer output stops with ERROR instead of false PASS", () => {
+    const m = new LoopMachine(cfg(), state());
+    m.start("g");
+    m.onCoderTurn(coderTurn());
+    m.onDiff(null);
+    const e = m.onReviewerTurn({
+      messageID: "rm", text: "I think this passes", structured: null, error: null,
+    });
+    expect(e.type).toBe("STOP");
+    if (e.type === "STOP") expect(e.outcome.kind).toBe("ERROR");
+  });
+
+  it("CHANGES_REQUIRED without findings stops with ERROR instead of false PASS", () => {
+    const m = new LoopMachine(cfg(), state());
+    m.start("g");
+    m.onCoderTurn(coderTurn());
+    m.onDiff(null);
+    const e = m.onReviewerTurn(reviewerTurn("CHANGES_REQUIRED", {nextCoderPrompt: "fix unspecified things"}));
+    expect(e.type).toBe("STOP");
+    if (e.type === "STOP") expect(e.outcome.kind).toBe("ERROR");
+  });
+
+  it("material findings override an inconsistent PASS label", () => {
+    const m = new LoopMachine(cfg(), state());
+    m.start("g");
+    m.onCoderTurn(coderTurn());
+    m.onDiff(null);
+    const e = m.onReviewerTurn(reviewerTurn("PASS", {
+      findings: [{severity: "high", location: "f", problem: "p", impact: "i", recommended_fix: "r", verification: "v"}],
+      nextCoderPrompt: "fix it",
+    }));
+    expect(e.type).toBe("SEND_CODER");
   });
 
   it("error turn stops with ERROR outcome", () => {

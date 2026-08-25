@@ -41,6 +41,22 @@ describe("SelectionStore", () => {
     expect(s2.reviewer.agent).toBe("a2");
   });
 
+  it("replaces an existing selections file on consecutive Windows-safe flushes", () => {
+    const s = new SelectionStore(dir);
+    s.setCoder({agent: "first", model: null});
+    s.flush();
+    s.setCoder({agent: "second", model: null});
+    s.flush();
+    expect(new SelectionStore(dir).coder.agent).toBe("second");
+  });
+
+  it("returns defensive snapshots", () => {
+    const s = new SelectionStore(dir);
+    const snapshot = s.snapshot();
+    snapshot.coder.agent = "mutated";
+    expect(s.coder.agent).toBe("build");
+  });
+
   it("normalizes invalid stored data to defaults", () => {
     const s = new SelectionStore(dir);
     s.replaceAll({

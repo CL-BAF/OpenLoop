@@ -1,6 +1,7 @@
-import {existsSync, readFileSync, writeFileSync, renameSync, mkdirSync} from "node:fs";
+import {existsSync, readFileSync, writeFileSync, mkdirSync} from "node:fs";
 import {resolve, dirname} from "node:path";
 import type {Selections, SessionSelection} from "./types.js";
+import {replaceFile} from "./state.js";
 
 const SELECTION_FILENAME = "selections.json";
 
@@ -19,22 +20,25 @@ export class SelectionStore {
   private selections: Selections;
   private dirty = false;
 
-  constructor(stateDir: string) {
+  private readonly defaults: Selections;
+
+  constructor(stateDir: string, defaults: Selections = DEFAULT_SELECTIONS) {
     this.filePath = resolve(stateDir, SELECTION_FILENAME);
+    this.defaults = cloneSelections(defaults);
     this.selections = this.load();
   }
 
   private load(): Selections {
-    if (!existsSync(this.filePath)) return structuredClone(DEFAULT_SELECTIONS);
+    if (!existsSync(this.filePath)) return cloneSelections(this.defaults);
     try {
       const raw = readFileSync(this.filePath, "utf8");
       const parsed = JSON.parse(raw) as Partial<Selections>;
       return {
-        coder: normalize(parsed.coder, DEFAULT_SELECTIONS.coder),
-        reviewer: normalize(parsed.reviewer, DEFAULT_SELECTIONS.reviewer),
+        coder: normalize(parsed.coder, this.defaults.coder),
+        reviewer: normalize(parsed.reviewer, this.defaults.reviewer),
       };
     } catch {
-      return structuredClone(DEFAULT_SELECTIONS);
+      return cloneSelections(this.defaults);
     }
   }
 
@@ -44,13 +48,13 @@ export class SelectionStore {
     mkdirSync(dir, {recursive: true});
     const tmp = this.filePath + ".tmp";
     writeFileSync(tmp, JSON.stringify(this.selections, null, 2), "utf8");
-    renameSync(tmp, this.filePath);
+    replaceFile(tmp, this.filePath);
     this.dirty = false;
   }
 
   get coder(): SessionSelection { return this.selections.coder; }
   get reviewer(): SessionSelection { return this.selections.reviewer; }
-  snapshot(): Selections { return this.selections; }
+  snapshot(): Selections { return cloneSelections(this.selections); }
 
   setCoder(s: SessionSelection): void {
     if (!equalSel(this.selections.coder, s)) { this.selections = {...this.selections, coder: s}; this.dirty = true; }
@@ -59,9 +63,22 @@ export class SelectionStore {
     if (!equalSel(this.selections.reviewer, s)) { this.selections = {...this.selections, reviewer: s}; this.dirty = true; }
   }
   replaceAll(s: Selections): void {
-    this.selections = {coder: s.coder, reviewer: s.reviewer};
+    this.selections = cloneSelections(s);
     this.dirty = true;
   }
+
+  /** Restore an in-memory snapshot after a failed transactional write. */
+  restore(s: Selections): void {
+    this.selections = cloneSelections(s);
+    this.dirty = false;
+  }
+}
+
+function cloneSelections(s: Selections): Selections {
+  return {
+    coder: {agent: s.coder.agent, model: s.coder.model ? {...s.coder.model} : null},
+    reviewer: {agent: s.reviewer.agent, model: s.reviewer.model ? {...s.reviewer.model} : null},
+  };
 }
 
 function normalize(p: Partial<SessionSelection> | undefined, fallback: SessionSelection): SessionSelection {

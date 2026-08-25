@@ -30,13 +30,15 @@ function envBool(key: string, fallback: boolean): boolean {
 
 function parseModel(value: string | undefined, fieldName: string): ModelRef | null {
   if (!value) return null;
-  const parts = value.split("/");
-  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+  const separator = value.indexOf("/");
+  const providerID = value.slice(0, separator).trim();
+  const modelID = value.slice(separator + 1).trim();
+  if (separator <= 0 || !providerID || !modelID) {
     throw new ConfigError(
       `${fieldName} must be in the form "<providerID>/<modelID>" (e.g. "ollama-cloud/glm-4.6"), got: ${value}`,
     );
   }
-  return {providerID: parts[0]!, modelID: parts[1]!};
+  return {providerID, modelID};
 }
 
 export interface LoadConfigInput {

@@ -1,6 +1,6 @@
-import {mkdirSync, readFileSync, writeFileSync, existsSync, renameSync} from "node:fs";
+import {mkdirSync, readFileSync, writeFileSync, existsSync, renameSync, rmSync, copyFileSync} from "node:fs";
 import {resolve, dirname} from "node:path";
-import type {PersistedState, RoundRecord} from "./types.js";
+import type {LoopOutcome, PersistedState, RoundRecord} from "./types.js";
 
 const STATE_FILENAME = "state.json";
 
@@ -19,7 +19,15 @@ export class StateStore {
   }
 
   private defaultState(goal: string): PersistedState {
-    return {version: 1, goal, coderSessionID: null, reviewerSessionID: null, rounds: [], lastUpdated: Date.now()};
+    return {
+      version: 1,
+      goal,
+      coderSessionID: null,
+      reviewerSessionID: null,
+      rounds: [],
+      outcome: null,
+      lastUpdated: Date.now(),
+    };
   }
 
   private load(goal: string): PersistedState {
@@ -34,6 +42,7 @@ export class StateStore {
         coderSessionID: parsed.coderSessionID ?? null,
         reviewerSessionID: parsed.reviewerSessionID ?? null,
         rounds: Array.isArray(parsed.rounds) ? (parsed.rounds as RoundRecord[]) : [],
+        outcome: isLoopOutcome(parsed.outcome) ? parsed.outcome : null,
         lastUpdated: parsed.lastUpdated ?? Date.now(),
       };
     } catch {
@@ -48,7 +57,7 @@ export class StateStore {
     mkdirSync(dir, {recursive: true});
     const tmp = this.filePath + ".tmp";
     writeFileSync(tmp, JSON.stringify(this.state, null, 2), "utf8");
-    renameSync(tmp, this.filePath);
+    replaceFile(tmp, this.filePath);
     this.dirty = false;
   }
 
@@ -66,4 +75,34 @@ export class StateStore {
 
   snapshot(): Readonly<PersistedState> { return this.state; }
   replaceFrom(snap: PersistedState): void { this.state = {...snap}; this.dirty = true; }
+}
+
+function isLoopOutcome(value: unknown): value is LoopOutcome {
+  if (!value || typeof value !== "object" || !("kind" in value) || !("rounds" in value)) return false;
+  const candidate = value as {kind?: unknown; rounds?: unknown; finalSummary?: unknown; error?: unknown};
+  if (typeof candidate.rounds !== "number" || !Number.isInteger(candidate.rounds) || candidate.rounds < 0) return false;
+  if (candidate.kind === "PASS" || candidate.kind === "MAX_ROUNDS") {
+    return typeof candidate.finalSummary === "string";
+  }
+  if (candidate.kind === "ERROR") return typeof candidate.error === "string";
+  return candidate.kind === "ABORTED";
+}
+
+/**
+ * Replace a JSON file while tolerating Windows' refusal to rename over an
+ * existing destination. The temporary file remains in the same directory so
+ * the normal path is atomic on platforms that support replacement renames.
+ */
+export function replaceFile(tmp: string, destination: string): void {
+  try {
+    renameSync(tmp, destination);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EEXIST" && code !== "EPERM") throw error;
+    // copyFileSync replaces an existing file without first deleting the only
+    // good copy. It is not atomic, but preserves the previous destination if
+    // opening the replacement fails.
+    copyFileSync(tmp, destination);
+    rmSync(tmp, {force: true});
+  }
 }
