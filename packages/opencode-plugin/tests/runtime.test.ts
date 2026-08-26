@@ -110,7 +110,7 @@ function mockClient(opts: MockOptions = {}): OpencodeClient {
     },
     tool: {
       ids: vi.fn(async () => ({
-        data: ["read", "grep", "bash", "edit", "task", "openloop_start_goal"],
+        data: ["read", "grep", "bash", "edit", "task", "openloop_start_goal", "openloop_run"],
         error: undefined,
         response: undefined as never,
       })),
@@ -150,6 +150,7 @@ describe("LoopRuntime integration-shaped orchestration", () => {
       {permission: "bash", pattern: "*", action: "deny"},
       {permission: "task", pattern: "*", action: "deny"},
       {permission: "openloop_start_goal", pattern: "*", action: "deny"},
+      {permission: "openloop_run", pattern: "*", action: "deny"},
     ]));
 
     const prompts = (client.session.promptAsync as ReturnType<typeof vi.fn>).mock.calls;

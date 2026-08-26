@@ -8,8 +8,6 @@ import {delimiter, dirname, join, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 
 import {createOpencodeClient} from "@opencode-ai/sdk/v2";
-import {SelectionStore} from "../packages/core/dist/index.js";
-import {LoopRuntime} from "../packages/opencode-plugin/dist/index.js";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const fixture = await mkdtemp(join(tmpdir(), "openloop-live-"));
@@ -20,7 +18,6 @@ const model = {providerID: "openloop-smoke", modelID: "deterministic"};
 let openCode;
 let modelServer;
 let client;
-let runtime;
 let openCodeVersion = "unknown";
 const serverLog = [];
 const modelLog = [];
@@ -71,10 +68,16 @@ try {
   openCode = started.process;
   client = started.client;
   const toolIDs = started.toolIDs;
-  for (const id of ["openloop_start_goal", "openloop_status", "openloop_stop", "openloop_setup", "openloop_config"]) {
+  for (const id of ["openloop_run", "openloop_start_goal", "openloop_status", "openloop_stop", "openloop_setup", "openloop_config"]) {
     assert(toolIDs.includes(id), `project-local plugin did not register ${id}`);
   }
   const resolvedConfig = unwrap(await withDeadline(client.config.get({directory: fixture}), 30_000, "resolved config"), "resolved config");
+  assert.equal(
+    resolvedConfig.command?.OpenLoop?.template?.includes("$ARGUMENTS"),
+    true,
+    "plugin did not register the /OpenLoop command template",
+  );
+  assert.equal(resolvedConfig.command?.OpenLoop?.agent, "build", "/OpenLoop command must activate the build agent");
   const configuredProviders = unwrap(await withDeadline(client.config.providers({directory: fixture}), 30_000, "configured providers"), "configured providers");
   const smokeProvider = configuredProviders.providers.find((provider) => provider.id === model.providerID);
   assert(
@@ -82,24 +85,16 @@ try {
     `deterministic model missing from active config: providers=${configuredProviders.providers.map((provider) => provider.id).join(",")}`,
   );
 
-  const config = {
-    coderModel: model,
-    reviewerModel: model,
-    coderAgent: "build",
-    reviewerAgent: "build",
-    maxRounds: 3,
-    reviewerReadonly: true,
-    turnTimeoutMs: 30_000,
-    pollIntervalMs: 50,
-    projectDir: fixture,
-    stateDir,
-  };
-  const selections = new SelectionStore(stateDir, {
-    coder: {agent: "build", model},
-    reviewer: {agent: "build", model},
-  });
-  runtime = new LoopRuntime(config, client, stateDir, selections);
-  const outcome = await withDeadline(runtime.start("Create and then correctly repair the smoke marker."), 120_000, "live loop");
+  const control = unwrap(await client.session.create({title: "OpenLoop command smoke"}), "control session");
+  createdSessionIDs.add(control.id);
+  const commandArguments = `Builder=${model.providerID}/${model.modelID} & Reviewer=${model.providerID}/${model.modelID} [Create and then correctly repair the smoke marker.]`;
+  unwrap(await withDeadline(client.session.command({
+    sessionID: control.id,
+    command: "OpenLoop",
+    arguments: commandArguments,
+    model: `${model.providerID}/${model.modelID}`,
+  }), 30_000, "/OpenLoop command"), "/OpenLoop command");
+  const outcome = await withDeadline(waitForOutcome(join(stateDir, "state.json")), 120_000, "live loop");
   assert.deepEqual(outcome, {kind: "PASS", rounds: 2, finalSummary: "The round-two repair is correct."});
 
   const sessions = unwrap(await client.session.list(), "session list");
@@ -116,7 +111,7 @@ try {
   const denied = new Set((reviewerDetails.permission ?? [])
     .filter((rule) => rule.action === "deny" && rule.pattern === "*")
     .map((rule) => rule.permission));
-  for (const permission of ["edit", "write", "apply_patch", "bash", "task", "openloop_start_goal"]) {
+  for (const permission of ["edit", "write", "apply_patch", "bash", "task", "openloop_start_goal", "openloop_run"]) {
     assert(denied.has(permission), `reviewer lost read-only deny for ${permission}`);
   }
 
@@ -144,7 +139,6 @@ try {
   if (serverLog.length) process.stderr.write(`\nOpenCode server log:\n${serverLog.join("")}\n`);
   process.exitCode = 1;
 } finally {
-  if (runtime) await settleWithin(runtime.dispose(), 2_000);
   if (client) {
     // Cleanup is deliberately restricted to IDs persisted by this temporary
     // run. Never enumerate and delete the user's unrelated OpenCode sessions.
@@ -296,6 +290,16 @@ async function withDeadline(promise, timeoutMs, label) {
   }
 }
 
+async function waitForOutcome(statePath) {
+  for (;;) {
+    try {
+      const state = JSON.parse(await readFile(statePath, "utf8"));
+      if (state.outcome) return state.outcome;
+    } catch {}
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  }
+}
+
 async function settleWithin(promise, timeoutMs) {
   let timer;
   try {
@@ -343,9 +347,14 @@ async function startModelServer(outputPath, requests) {
       const latestUser = [...messages].reverse().find((message) => message.role === "user");
       const latestTool = messages.at(-1)?.role === "tool";
       const reviewer = /^# Goal under review/m.test(contentText(latestUser));
+      const openLoopCommand = /Call openloop_run exactly once/.test(contentText(latestUser));
 
       let payload;
-      if (reviewer) {
+      if (openLoopCommand && !latestTool) {
+        const spec = /Builder=[\s\S]*$/m.exec(contentText(latestUser))?.[0]?.trim();
+        if (!spec) throw new Error("/OpenLoop command template did not preserve $ARGUMENTS");
+        payload = toolCall("openloop_run", {spec});
+      } else if (reviewer) {
         const round = Number(/round\s+(\d+)/i.exec(contentText(latestUser))?.[1] ?? 1);
         const verdict = round === 1 ? {
           verdict: "CHANGES_REQUIRED",

@@ -1,5 +1,27 @@
 import {describe, expect, it} from "vitest";
-import {reviewerSystemPrompt} from "../src/prompts.js";
+import {coderInitialPrompt, coderSystemPrompt, reviewerPrompt, reviewerSystemPrompt} from "../src/prompts.js";
+
+describe("role-specific prompts", () => {
+  it("turns one goal into distinct builder and reviewer briefs", () => {
+    const goal = "Repair authentication and add regression tests.";
+    const builder = `${coderSystemPrompt()}\n${coderInitialPrompt(goal)}`;
+    const reviewer = `${reviewerSystemPrompt()}\n${reviewerPrompt({
+      goal,
+      round: 1,
+      coderSummary: "Implemented a fix.",
+      diff: null,
+    })}`;
+
+    expect(builder).toContain("You are the CODER agent");
+    expect(builder).toContain("implement/fix");
+    expect(reviewer).toContain("You are the REVIEWER agent");
+    expect(reviewer).toContain("independently inspect");
+    expect(reviewer).toContain("next_coder_prompt");
+    expect(builder).not.toBe(reviewer);
+    expect(builder).toContain(goal);
+    expect(reviewer).toContain(goal);
+  });
+});
 
 describe("reviewerSystemPrompt", () => {
   it("contains the complete plain-JSON verdict contract", () => {

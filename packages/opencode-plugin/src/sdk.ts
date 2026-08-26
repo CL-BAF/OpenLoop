@@ -155,12 +155,20 @@ export async function unwrap<T>(
 function describeError(e: unknown): string {
   if (e && typeof e === "object") {
     const name = (e as {name?: string}).name;
+    const message = (e as {message?: unknown}).message;
     const data = (e as {data?: {message?: string}}).data;
     if (name === "NotFoundError") return `not found: ${data?.message ?? ""}`;
     if (name === "BadRequest") return `bad request: ${data?.message ?? ""}`;
     if (name && data?.message) return `${name}: ${data.message}`;
+    if (name && typeof message === "string" && message) return `${name}: ${message}`;
     if (name) return name;
+    if (typeof message === "string" && message) return message;
     if (data?.message) return data.message;
   }
-  try { return JSON.stringify(e); } catch { return String(e); }
+  try {
+    const json = JSON.stringify(e);
+    return json === undefined ? String(e) : json;
+  } catch {
+    return String(e);
+  }
 }

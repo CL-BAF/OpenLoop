@@ -1,4 +1,4 @@
-import {createOpencodeClient as createClientV2, type OpencodeClient} from "@opencode-ai/sdk/v2";
+import type {OpencodeClient} from "@opencode-ai/sdk/v2";
 import {resolve} from "node:path";
 import {randomBytes} from "node:crypto";
 import type {Plugin, PluginInput, Hooks} from "@opencode-ai/plugin";
@@ -17,6 +17,8 @@ import {
   unwrap, SdkError,
 } from "./sdk.js";
 import {fetchCatalog, validateSelection, formatCatalog, parseModelRef, type Catalog} from "./catalog.js";
+import {adaptPluginClient} from "./client.js";
+import {OPENLOOP_COMMAND_USAGE, parseOpenLoopCommand} from "./command.js";
 
 export type {Plugin, PluginInput, Hooks};
 
@@ -33,7 +35,7 @@ const SCOPE = "openloop";
  * drives the review/fix loop using the OpenCode SDK + session events.
  */
 export const OpenLoopPlugin: Plugin = async (input: PluginInput) => {
-  const {serverUrl, directory} = input;
+  const {directory} = input;
   const stateDir = resolveStateDir(directory);
 
   let config: OpenLoopConfig;
@@ -47,19 +49,17 @@ export const OpenLoopPlugin: Plugin = async (input: PluginInput) => {
     throw e;
   }
 
-  // Build a v2 SDK client wired to the same server as the plugin. The plugin's
-  // input client is the legacy surface and does not expose the current session,
-  // configuration, and catalog endpoints used by the runtime.
-  const client: OpencodeClient = createClientV2({
-    baseUrl: serverUrl.origin,
-    directory,
-    headers: serverAuthHeaders(),
-  });
+  // Use OpenCode's injected transport. It works both with a headless HTTP
+  // server and with embedded Desktop/TUI instances that expose no listener.
+  const client: OpencodeClient = adaptPluginClient(input.client, directory);
 
   const runtime = new LoopRuntime(config, client, stateDir, new SelectionStore(stateDir, {
     coder: {agent: config.coderAgent, model: config.coderModel},
     reviewer: {agent: config.reviewerAgent, model: config.reviewerModel},
   }));
+  // Serializes the catalog-validation + persistence window before runtime.start
+  // synchronously claims the run. Calls can arrive from different root sessions.
+  let preparingRun = false;
 
   const hooks: Hooks = {
     dispose: async () => {
@@ -72,7 +72,66 @@ export const OpenLoopPlugin: Plugin = async (input: PluginInput) => {
         log.error(SCOPE, `event handler error: ${String((e as Error).message ?? e)}`);
       }
     },
+    config: async (openCodeConfig) => {
+      openCodeConfig.command ??= {};
+      openCodeConfig.command.OpenLoop = {
+        description: "Run an independent OpenLoop builder/reviewer cycle",
+        agent: "build",
+        template: [
+          "Call openloop_run exactly once with `spec` set to the complete text below, preserving it verbatim.",
+          "Do not call openloop_setup first and do not use a shell command.",
+          "After the tool returns, report its result concisely.",
+          "",
+          "$ARGUMENTS",
+        ].join("\n"),
+      };
+    },
     tool: {
+      openloop_run: tool({
+        description:
+          `Parse and run the public OpenLoop command format: ${OPENLOOP_COMMAND_USAGE}. Validates both models against the live OpenCode catalog, preserves the configured coder/reviewer agents, saves the model selections, and starts the loop.`,
+        args: {
+          spec: tool.schema.string().describe(
+            'The complete command arguments, for example: Builder=ollama-cloud/model-a & Reviewer=ollama-cloud/model-b [Fix the failing tests]',
+          ),
+        },
+        async execute(args) {
+          if (runtime.status().running || preparingRun) {
+            return {title: "OpenLoop", output: "A loop is already running. Use openloop_status to monitor it."};
+          }
+          preparingRun = true;
+          try {
+            const parsed = parseOpenLoopCommand(args.spec ?? "");
+            if (!parsed.ok) {
+              return {title: "OpenLoop", output: `Rejected: ${parsed.error}`};
+            }
+
+            const current = runtime.getSelections();
+            const next: Selections = {
+              coder: {agent: current.coder.agent, model: parsed.command.builderModel},
+              reviewer: {agent: current.reviewer.agent, model: parsed.command.reviewerModel},
+            };
+            const applied = await runtime.applySelections(next);
+            if (!applied.ok) return {title: "OpenLoop", output: `Rejected: ${applied.error}`};
+            void runtime.start(parsed.command.goal).catch((e) => {
+              log.error(SCOPE, `loop failed: ${String((e as Error).message ?? e)}`);
+            });
+            return {
+              title: "OpenLoop started",
+              output: [
+                "Started the independent builder/reviewer loop in the background.",
+                `Builder model: ${formatModel(parsed.command.builderModel)}`,
+                `Reviewer model: ${formatModel(parsed.command.reviewerModel)}`,
+                "Use openloop_status to monitor progress and the final outcome.",
+              ].join("\n"),
+            };
+          } catch (e) {
+            return {title: "OpenLoop", output: `Error: ${String((e as Error).message ?? e)}`};
+          } finally {
+            preparingRun = false;
+          }
+        },
+      }),
       openloop_start_goal: tool({
         description:
           "Start a background OpenLoop coder/reviewer loop for a goal. The coder implements/fixes; an independent reviewer inspects and reports findings; the loop repeats until PASS, error, stop, or max rounds. Use openloop_status for the final outcome.",
@@ -82,7 +141,7 @@ export const OpenLoopPlugin: Plugin = async (input: PluginInput) => {
         async execute(args) {
           const goal = (args.goal ?? "").trim();
           if (!goal) return {title: "OpenLoop", output: "Error: goal is required."};
-          if (runtime.status().running) {
+          if (runtime.status().running || preparingRun) {
             return {title: "OpenLoop", output: "A loop is already running. Use openloop_status to monitor it."};
           }
           // Run asynchronously; the tool returns immediately so the calling session isn't blocked.
@@ -131,6 +190,9 @@ export const OpenLoopPlugin: Plugin = async (input: PluginInput) => {
           const hasArgs = args.coder_agent !== undefined || args.coder_model !== undefined
             || args.reviewer_agent !== undefined || args.reviewer_model !== undefined;
           const current = runtime.getSelections();
+          if (hasArgs && preparingRun) {
+            return {title: "OpenLoop setup", output: "Rejected: an OpenLoop run is currently being prepared. Try again after it starts."};
+          }
           if (!hasArgs) {
             let catalog: Catalog;
             try {
@@ -189,13 +251,6 @@ export const OpenLoopPlugin: Plugin = async (input: PluginInput) => {
   return hooks;
 };
 
-function serverAuthHeaders(): Record<string, string> | undefined {
-  const password = process.env.OPENCODE_SERVER_PASSWORD;
-  if (!password) return undefined;
-  const username = process.env.OPENCODE_SERVER_USERNAME || "opencode";
-  return {Authorization: `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`};
-}
-
 /** Resolve the OpenLoop state directory for a project. */
 function resolveStateDir(projectDir: string): string {
   return resolve(projectDir, ".opencode-orchestrator");
@@ -203,8 +258,12 @@ function resolveStateDir(projectDir: string): string {
 
 /** Format current selections for display in tools. */
 function formatCurrent(s: Selections): string {
-  const fmt = (sel: SessionSelection) => `agent=${sel.agent}, model=${sel.model ? `${sel.model.providerID}/${sel.model.modelID}` : "(server default)"}`;
+  const fmt = (sel: SessionSelection) => `agent=${sel.agent}, model=${sel.model ? formatModel(sel.model) : "(server default)"}`;
   return `Current selections:\n  coder: ${fmt(s.coder)}\n  reviewer: ${fmt(s.reviewer)}`;
+}
+
+function formatModel(model: NonNullable<SessionSelection["model"]>): string {
+  return `${model.providerID}/${model.modelID}`;
 }
 
 function parseSetupModel(
@@ -312,9 +371,8 @@ class TurnWatchdog {
 /**
  * Runtime that owns the machine, sessions, and event-driven loop execution.
  *
- * The loop is started on demand via the `openloop_start_goal` custom tool (so the
- * user/AI can trigger it from within OpenCode). It can also be started by
- * calling `runtime.start(goal)` programmatically (e.g. from a future MCP tool).
+ * The loop is started on demand through the OpenLoop custom tools. It can also
+ * be started by calling `runtime.start(goal)` programmatically.
  */
 export class LoopRuntime {
   private machine: LoopMachine | null = null;
@@ -432,7 +490,7 @@ export class LoopRuntime {
     return await donePromise;
   }
 
-  /** Current status for external observation (future MCP adapter). */
+  /** Current status for tool and programmatic observation. */
   status(): {running: boolean; phase: string; round: number; outcome: string; detail: string} {
     const outcome = this.lastOutcome;
     return {
