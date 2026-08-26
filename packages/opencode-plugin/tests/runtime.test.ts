@@ -158,8 +158,195 @@ describe("LoopRuntime integration-shaped orchestration", () => {
     await expect(rt.runReviewerVerification("reviewer-1", ["test"]))
       .resolves.toContain("reviewer-runtime-check-ok");
 
-    await rt.stop();
-    await expect(running).resolves.toMatchObject({kind: "ABORTED"});
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "reviewer-1"}} as never);
+    await expect(running).resolves.toMatchObject({kind: "PASS"});
+  });
+
+  it("rejects a reviewer verdict that skipped available verification", async () => {
+    writeFileSync(join(dir, "package.json"), JSON.stringify({
+      name: "runtime-verification-required-fixture",
+      private: true,
+      scripts: {test: "node -e \"console.log('must-run')\""},
+    }), "utf8");
+    const client = mockClient({statusAfterPrompt: "busy"});
+    const rt = makeRuntime(client, {turnTimeoutMs: 30_000, pollIntervalMs: 30_000});
+    const running = rt.start("goal");
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(1));
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "coder-1"}} as never);
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(2));
+
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "reviewer-1"}} as never);
+
+    await expect(running).resolves.toMatchObject({
+      kind: "ERROR",
+      error: expect.stringContaining("did not complete all openloop_verify checks"),
+    });
+  });
+
+  it("rejects a reviewer verdict that ran only part of the approved checks", async () => {
+    writeFileSync(join(dir, "package.json"), JSON.stringify({
+      name: "runtime-verification-partial-fixture",
+      private: true,
+      scripts: {
+        test: "node -e \"console.log('test-ok')\"",
+        typecheck: "node -e \"console.log('typecheck-ok')\"",
+      },
+    }), "utf8");
+    const client = mockClient({statusAfterPrompt: "busy"});
+    const rt = makeRuntime(client, {
+      reviewerVerificationScripts: ["test", "typecheck"],
+      turnTimeoutMs: 30_000,
+      pollIntervalMs: 30_000,
+      verificationTimeoutMs: 30_000,
+    });
+    const running = rt.start("goal");
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(1));
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "coder-1"}} as never);
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(2));
+    await rt.runReviewerVerification("reviewer-1", ["test"]);
+
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "reviewer-1"}} as never);
+
+    await expect(running).resolves.toMatchObject({
+      kind: "ERROR",
+      error: expect.stringContaining("missing scripts: typecheck"),
+    });
+  });
+
+  it("rejects an effective PASS when a completed verification check failed", async () => {
+    writeFileSync(join(dir, "package.json"), JSON.stringify({
+      name: "runtime-verification-failure-fixture",
+      private: true,
+      scripts: {test: "node -e \"process.exit(7)\""},
+    }), "utf8");
+    const client = mockClient({statusAfterPrompt: "busy"});
+    const rt = makeRuntime(client, {
+      turnTimeoutMs: 30_000,
+      pollIntervalMs: 30_000,
+      verificationTimeoutMs: 30_000,
+    });
+    const running = rt.start("goal");
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(1));
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "coder-1"}} as never);
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(2));
+    await expect(rt.runReviewerVerification("reviewer-1", ["test"]))
+      .resolves.toContain("FAIL (exit 7)");
+
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "reviewer-1"}} as never);
+
+    await expect(running).resolves.toMatchObject({
+      kind: "ERROR",
+      error: expect.stringContaining("cannot complete the round without material findings"),
+    });
+  });
+
+  it("retains the pre-run catalog when a verification script mutates package.json", async () => {
+    writeFileSync(join(dir, "mutate-manifest.cjs"), [
+      "const fs = require('node:fs');",
+      "const manifest = JSON.parse(fs.readFileSync('package.json', 'utf8'));",
+      "manifest.scripts = {};",
+      "fs.writeFileSync('package.json', JSON.stringify(manifest));",
+      "process.exit(9);",
+    ].join("\n"), "utf8");
+    writeFileSync(join(dir, "package.json"), JSON.stringify({
+      name: "runtime-verification-manifest-mutation-fixture",
+      private: true,
+      scripts: {test: "node mutate-manifest.cjs"},
+    }), "utf8");
+    const client = mockClient({statusAfterPrompt: "busy"});
+    const rt = makeRuntime(client, {
+      turnTimeoutMs: 30_000,
+      pollIntervalMs: 30_000,
+      verificationTimeoutMs: 30_000,
+    });
+    const running = rt.start("goal");
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(1));
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "coder-1"}} as never);
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(2));
+    await expect(rt.runReviewerVerification("reviewer-1", ["test"]))
+      .resolves.toContain("FAIL (exit 9)");
+
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "reviewer-1"}} as never);
+    await expect(running).resolves.toMatchObject({
+      kind: "ERROR",
+      error: expect.stringContaining("test (failed with exit code 9)"),
+    });
+  });
+
+  it("allows failed verification to reach the builder only through a material finding", async () => {
+    writeFileSync(join(dir, "package.json"), JSON.stringify({
+      name: "runtime-verification-fix-cycle-fixture",
+      private: true,
+      scripts: {test: "node -e \"process.exit(1)\""},
+    }), "utf8");
+    const client = mockClient({
+      statusAfterPrompt: "busy",
+      reviewerStructured: {
+        verdict: "CHANGES_REQUIRED",
+        summary: "The verification command fails.",
+        findings: [{
+          severity: "high",
+          location: "package test suite",
+          problem: "The test command exits unsuccessfully.",
+          impact: "The project is not verified.",
+          recommended_fix: "Repair the failing test or implementation.",
+          verification: "Run the test script again.",
+        }],
+        next_coder_prompt: "Repair the failing test command and verify it.",
+        research: {performed: false},
+      },
+    });
+    const rt = makeRuntime(client, {
+      turnTimeoutMs: 30_000,
+      pollIntervalMs: 30_000,
+      verificationTimeoutMs: 30_000,
+    });
+    const running = rt.start("goal");
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(1));
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "coder-1"}} as never);
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(2));
+    await rt.runReviewerVerification("reviewer-1", ["test"]);
+
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "reviewer-1"}} as never);
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(3));
+    expect(rt.status()).toMatchObject({running: true, phase: "CODER_RUNNING", round: 2});
+
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "coder-1"}} as never);
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(4));
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "reviewer-1"}} as never);
+    await expect(running).resolves.toMatchObject({
+      kind: "ERROR",
+      error: expect.stringContaining("round 2; missing scripts: test"),
+    });
+  });
+
+  it("does not let recoverable structured-output errors bypass verification", async () => {
+    writeFileSync(join(dir, "package.json"), JSON.stringify({
+      name: "runtime-verification-structured-error-fixture",
+      private: true,
+      scripts: {test: "node -e \"process.exit(0)\""},
+    }), "utf8");
+    const reviewerText = JSON.stringify({
+      verdict: "PASS", summary: "recovered", findings: [],
+      next_coder_prompt: "done", research: {performed: false},
+    });
+    const client = mockClient({
+      statusAfterPrompt: "busy",
+      reviewerError: {name: "StructuredOutputError", data: {message: "schema retries exhausted"}},
+      reviewerStructured: null,
+      reviewerText,
+    });
+    const rt = makeRuntime(client, {turnTimeoutMs: 30_000, pollIntervalMs: 30_000});
+    const running = rt.start("goal");
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(1));
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "coder-1"}} as never);
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(2));
+
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "reviewer-1"}} as never);
+    await expect(running).resolves.toMatchObject({
+      kind: "ERROR",
+      error: expect.stringContaining("missing scripts: test"),
+    });
   });
 
   it("aborts reviewer verification when the loop is stopped", async () => {

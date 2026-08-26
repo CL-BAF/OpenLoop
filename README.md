@@ -194,7 +194,7 @@ Read-only mode is enabled by default. When the reviewer root session is created,
 
 This is enforced at the reviewer session boundary rather than only requested in the prompt. If the live tool catalog cannot be queried, OpenLoop fails closed instead of creating a reviewer with uncertain permissions.
 
-The reviewer receives one deliberately narrow execution capability: `openloop_verify`. It can be called only by the active reviewer root while a review turn is running. It accepts package-script names, not commands or arguments, and permits only names listed by `OPENLOOP_REVIEWER_VERIFY_SCRIPTS` that actually exist in the project's `package.json`. Scripts run sequentially with a per-script timeout, abort handling, Windows process-tree termination, and capped output. If no approved script exists, the reviewer must report that verification was unavailable rather than relying silently on the builder's claim.
+The reviewer receives one deliberately narrow execution capability: `openloop_verify`. It can be called only by the active reviewer root while a review turn is running. It accepts package-script names, not commands or arguments, and permits only names listed by `OPENLOOP_REVIEWER_VERIFY_SCRIPTS` that actually exist in the project's `package.json`. Scripts run sequentially with a per-script timeout, abort handling, process-tree termination, and capped output. When approved scripts exist, OpenLoop rejects a reviewer verdict unless that reviewer completed every available check in the current round. A failed, timed-out, or aborted check cannot produce an effective PASS unless the reviewer reports a material finding that sends the problem back to the builder. If no approved script exists, static review remains available and the reviewer must disclose that execution was unavailable rather than relying silently on the builder's claim.
 
 This is a model-facing least-privilege boundary, not an operating-system sandbox. A permitted package script executes the command already defined by the repository and may generate normal test or build artifacts. Review projects and package scripts as you would before running `npm test`; use a separate OS sandbox for untrusted repositories.
 
@@ -208,6 +208,7 @@ This is a model-facing least-privilege boundary, not an operating-system sandbox
 - Stop and dispose requests terminate in-flight reviewer verification, including child processes on Windows.
 - State writes are atomic and persisted after meaningful transitions.
 - Malformed reviewer output produces an error instead of a false `PASS`.
+- Reviewer verdicts cannot pass verification results forward from an earlier round or skip approved checks that are currently available.
 - Coder and reviewer session IDs are checked to ensure they are distinct root sessions.
 
 ## Troubleshooting

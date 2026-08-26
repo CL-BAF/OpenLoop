@@ -1,14 +1,15 @@
 import type {OpencodeClient} from "@opencode-ai/sdk/v2";
-import {resolve} from "node:path";
+import {existsSync} from "node:fs";
+import {join, resolve} from "node:path";
 import {randomBytes} from "node:crypto";
 import type {Plugin, PluginInput, Hooks} from "@opencode-ai/plugin";
 import {tool} from "@opencode-ai/plugin";
 import type {Event} from "@opencode-ai/sdk";
 import {
   type OpenLoopConfig, type LoopOutcome, type DiffSummary,
-  type SessionSelection, type Selections, type Effect, type PersistedState,
+  type SessionSelection, type Selections, type Effect, type PersistedState, type TurnResult,
   LoopMachine, StateStore, SelectionStore, loadConfig, ConfigError,
-  coderSystemPrompt, reviewerSystemPrompt,
+  coderSystemPrompt, reviewerSystemPrompt, parseVerdict, requiresChanges,
   log, banner, controlBanner, roundBanner, section,
 } from "@openloop/core";
 import {
@@ -19,7 +20,11 @@ import {
 import {fetchCatalog, validateSelection, formatCatalog, parseModelRef, type Catalog} from "./catalog.js";
 import {adaptPluginClient} from "./client.js";
 import {OPENLOOP_COMMAND_USAGE, parseOpenLoopCommand} from "./command.js";
-import {formatVerificationReport, runPackageVerification} from "./verification.js";
+import {
+  availableVerificationScripts,
+  formatVerificationReport,
+  runPackageVerification,
+} from "./verification.js";
 
 export type {Plugin, PluginInput, Hooks};
 
@@ -418,6 +423,13 @@ export class LoopRuntime {
   private consumingTurnToken: number | null = null;
   private verificationRunning = false;
   private verificationAbort: AbortController | null = null;
+  private reviewerVerificationRecord: {
+    round: number;
+    /** Scripts discovered before any verifier command could mutate the manifest. */
+    available: Set<string>;
+    /** A null value means the latest execution passed; otherwise it describes the failure. */
+    checks: Map<string, string | null>;
+  } | null = null;
   private runToken = 0;
 
   constructor(config: OpenLoopConfig, client: OpencodeClient, stateDir: string, selections: SelectionStore) {
@@ -481,6 +493,7 @@ export class LoopRuntime {
       throw new OpenLoopError("openloop_verify may only be called by the active OpenLoop reviewer session");
     }
     if (this.verificationRunning) throw new OpenLoopError("reviewer verification is already running");
+    const verificationRound = machine.round;
 
     const abort = new AbortController();
     const relayAbort = () => abort.abort();
@@ -496,6 +509,26 @@ export class LoopRuntime {
         timeoutMs: this.config.verificationTimeoutMs,
         signal: abort.signal,
       });
+      if (this.machine === machine
+        && machine.phase === "REVIEWER_RUNNING"
+        && machine.round === verificationRound
+        && machine.reviewerSessionID === sessionID) {
+        const previous = this.reviewerVerificationRecord?.round === verificationRound
+          ? this.reviewerVerificationRecord
+          : null;
+        const checks = new Map(previous?.checks ?? []);
+        for (const check of report.checks) {
+          const failure = check.aborted ? "aborted"
+            : check.timedOut ? "timed out"
+              : check.exitCode === 0 ? null : `failed with exit code ${check.exitCode ?? "unknown"}`;
+          checks.set(check.script, failure);
+        }
+        this.reviewerVerificationRecord = {
+          round: verificationRound,
+          available: new Set([...(previous?.available ?? []), ...report.available]),
+          checks,
+        };
+      }
       return formatVerificationReport(report);
     } finally {
       signal?.removeEventListener("abort", relayAbort);
@@ -519,6 +552,7 @@ export class LoopRuntime {
     const donePromise = new Promise<LoopOutcome>((resolve) => { this.doneResolve = resolve; });
     this.donePromise = donePromise;
     this.lastOutcome = null;
+    this.reviewerVerificationRecord = null;
 
     banner(`OpenLoop starting (max rounds: ${this.config.maxRounds})`);
     log.info(SCOPE, `goal accepted (${goal.length} characters)`);
@@ -688,8 +722,9 @@ export class LoopRuntime {
       watchdog?.cancel();
       this.expectedUserMessageID = null;
       const effect = machine.phase === "REVIEWER_RUNNING"
-        ? machine.onReviewerTurn(turn)
+        ? await this.reviewerTurnEffect(machine, turn, token)
         : machine.onCoderTurn(turn);
+      if (!effect) return;
       await this.dispatch(effect, token, machine);
     } catch (e) {
       if (e instanceof SdkError && e.code === "TurnNotReady") {
@@ -717,6 +752,73 @@ export class LoopRuntime {
     } finally {
       if (this.consumingTurnToken === token) this.consumingTurnToken = null;
     }
+  }
+
+  /** Require real per-round verification before accepting a reviewer verdict when checks exist. */
+  private async reviewerTurnEffect(
+    machine: LoopMachine,
+    turn: TurnResult,
+    token: number,
+  ): Promise<Effect | null> {
+    if (!this.isCurrentRun(token, machine) || machine.phase !== "REVIEWER_RUNNING") return null;
+    if (!this.config.reviewerVerification) return machine.onReviewerTurn(turn);
+    // StructuredOutputError can still contain valid recoverable JSON that the
+    // state machine accepts, so it must pass the same verification gate.
+    if (turn.error && turn.error.name !== "StructuredOutputError") return machine.onReviewerTurn(turn);
+    const manifestPath = join(this.config.projectDir, "package.json");
+    if (!existsSync(manifestPath)) return machine.onReviewerTurn(turn);
+    let available: string[];
+    try {
+      ({available} = await availableVerificationScripts(
+        this.config.projectDir,
+        this.config.reviewerVerificationScripts,
+      ));
+    } catch (error) {
+      if (!this.isCurrentRun(token, machine) || machine.phase !== "REVIEWER_RUNNING") return null;
+      return machine.onReviewerTurn({
+        ...turn,
+        structured: null,
+        error: {
+          name: "VerificationPreflightError",
+          message: `unable to determine reviewer verification scripts: ${String((error as Error).message ?? error)}`,
+        },
+      });
+    }
+    if (!this.isCurrentRun(token, machine) || machine.phase !== "REVIEWER_RUNNING") return null;
+    const record = this.reviewerVerificationRecord?.round === machine.round
+      ? this.reviewerVerificationRecord
+      : null;
+    // Retain the pre-execution catalog so a verifier script cannot remove its
+    // own package.json entry and make a failure disappear before acceptance.
+    const expected = [...new Set([...(record?.available ?? []), ...available])];
+    const missing = expected.filter((script) => !record?.checks.has(script));
+    if (missing.length > 0) {
+      return machine.onReviewerTurn({
+        ...turn,
+        structured: null,
+        error: {
+          name: "VerificationRequired",
+          message: `reviewer did not complete all openloop_verify checks in round ${machine.round}; missing scripts: ${missing.join(", ")}`,
+        },
+      });
+    }
+    const failed = expected.flatMap((script) => {
+      const failure = record?.checks.get(script);
+      return failure ? [`${script} (${failure})`] : [];
+    });
+    // The machine also treats a verdict with no material findings as PASS, so
+    // guard the effective outcome rather than trusting the verdict label alone.
+    if (failed.length > 0 && !requiresChanges(parseVerdict(turn))) {
+      return machine.onReviewerTurn({
+        ...turn,
+        structured: null,
+        error: {
+          name: "VerificationFailedCannotPass",
+          message: `reviewer cannot complete the round without material findings while verification failed: ${failed.join(", ")}`,
+        },
+      });
+    }
+    return machine.onReviewerTurn(turn);
   }
 
   /** Interpret an Effect returned by the machine. */
