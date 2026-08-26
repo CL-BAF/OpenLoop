@@ -76,6 +76,7 @@ export const OpenLoopPlugin: Plugin = async (input: PluginInput) => {
       openCodeConfig.command ??= {};
       openCodeConfig.command.OpenLoop = {
         description: "Run an independent OpenLoop builder/reviewer cycle",
+        agent: "build",
         template: [
           "Call openloop_run exactly once with `spec` set to the complete text below, preserving it verbatim.",
           "Do not call openloop_setup first and do not use a shell command.",

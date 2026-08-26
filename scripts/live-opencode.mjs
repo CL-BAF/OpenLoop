@@ -77,6 +77,7 @@ try {
     true,
     "plugin did not register the /OpenLoop command template",
   );
+  assert.equal(resolvedConfig.command?.OpenLoop?.agent, "build", "/OpenLoop command must activate the build agent");
   const configuredProviders = unwrap(await withDeadline(client.config.providers({directory: fixture}), 30_000, "configured providers"), "configured providers");
   const smokeProvider = configuredProviders.providers.find((provider) => provider.id === model.providerID);
   assert(
@@ -91,7 +92,6 @@ try {
     sessionID: control.id,
     command: "OpenLoop",
     arguments: commandArguments,
-    agent: "build",
     model: `${model.providerID}/${model.modelID}`,
   }), 30_000, "/OpenLoop command"), "/OpenLoop command");
   const outcome = await withDeadline(waitForOutcome(join(stateDir, "state.json")), 120_000, "live loop");

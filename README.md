@@ -82,6 +82,8 @@ Example:
 
 OpenCode expands `/OpenLoop` as a custom command. Its complete argument string is passed to OpenLoop's deterministic parser, which validates both models against the active OpenCode catalog, saves the selections for this project, and starts the loop.
 
+The command activates OpenCode's `build` agent for the short control turn that invokes OpenLoop. This is separate from the builder and reviewer worker-agent selections described below.
+
 The command keeps the currently configured builder and reviewer agent IDs. Both default to the OpenCode `build` agent. Agent IDs can be changed with `openloop_setup` or environment variables.
 
 ## Use with the OpenCode terminal interface
