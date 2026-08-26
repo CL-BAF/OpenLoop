@@ -3,6 +3,11 @@ import {buildReadonlyPermissions, unwrap} from "../src/sdk.js";
 import type {OpencodeClient} from "@opencode-ai/sdk/v2";
 
 describe("SDK response envelopes", () => {
+  it("preserves ordinary Error messages from failed SDK requests", async () => {
+    await expect(unwrap(Promise.resolve({error: new Error("connection refused")}), "list providers"))
+      .rejects.toThrow("list providers failed: Error: connection refused");
+  });
+
   it("does not treat an empty HTTP error response as prompt success", async () => {
     const response = new Response("server failed", {status: 503, statusText: "Unavailable"});
     await expect(unwrap(Promise.resolve({response}), "send prompt", true))
