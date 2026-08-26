@@ -84,7 +84,7 @@ export async function buildReadonlyPermissions(client: OpencodeClient): Promise<
 
 const READONLY_TOOL_IDS = new Set([
   "read", "glob", "grep", "list", "lsp", "todoread",
-  "webfetch", "websearch", "codesearch",
+  "webfetch", "websearch", "codesearch", "openloop_verify",
 ]);
 
 export const REVIEWER_PERMISSION_DENIES: PermissionRuleset = [

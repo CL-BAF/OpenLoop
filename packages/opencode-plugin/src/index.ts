@@ -19,6 +19,7 @@ import {
 import {fetchCatalog, validateSelection, formatCatalog, parseModelRef, type Catalog} from "./catalog.js";
 import {adaptPluginClient} from "./client.js";
 import {OPENLOOP_COMMAND_USAGE, parseOpenLoopCommand} from "./command.js";
+import {formatVerificationReport, runPackageVerification} from "./verification.js";
 
 export type {Plugin, PluginInput, Hooks};
 
@@ -87,6 +88,28 @@ export const OpenLoopPlugin: Plugin = async (input: PluginInput) => {
       };
     },
     tool: {
+      openloop_verify: tool({
+        description:
+          "Run independent reviewer verification without granting arbitrary shell access. Only configured package.json scripts may run, and only from the active OpenLoop reviewer session. With no checks, runs every configured script present in the project.",
+        args: {
+          checks: tool.schema.array(tool.schema.string().max(128)).min(1).max(20).optional().describe(
+            "Optional package.json script names to run, such as test, typecheck, lint, or build.",
+          ),
+        },
+        async execute(args, context) {
+          try {
+            return {
+              title: "OpenLoop reviewer verification",
+              output: await runtime.runReviewerVerification(context.sessionID, args.checks, context.abort),
+            };
+          } catch (error) {
+            return {
+              title: "OpenLoop reviewer verification",
+              output: `Verification unavailable: ${String((error as Error).message ?? error)}`,
+            };
+          }
+        },
+      }),
       openloop_run: tool({
         description:
           `Parse and run the public OpenLoop command format: ${OPENLOOP_COMMAND_USAGE}. Validates both models against the live OpenCode catalog, preserves the configured coder/reviewer agents, saves the model selections, and starts the loop.`,
@@ -241,7 +264,7 @@ export const OpenLoopPlugin: Plugin = async (input: PluginInput) => {
           const sel = formatCurrent(runtime.getSelections());
           return {
             title: "OpenLoop config",
-            output: `${sel}\n\nmax_rounds=${config.maxRounds} reviewer_readonly=${config.reviewerReadonly} turn_timeout_ms=${config.turnTimeoutMs} poll_interval_ms=${config.pollIntervalMs}`,
+            output: `${sel}\n\nmax_rounds=${config.maxRounds} reviewer_readonly=${config.reviewerReadonly} reviewer_verification=${config.reviewerVerification} reviewer_verify_scripts=${config.reviewerVerificationScripts.join(",")} verification_timeout_ms=${config.verificationTimeoutMs} turn_timeout_ms=${config.turnTimeoutMs} poll_interval_ms=${config.pollIntervalMs}`,
           };
         },
       }),
@@ -393,6 +416,8 @@ export class LoopRuntime {
   private expectedUserMessageID: string | null = null;
   /** Run token currently consuming an idle/error event, if any. */
   private consumingTurnToken: number | null = null;
+  private verificationRunning = false;
+  private verificationAbort: AbortController | null = null;
   private runToken = 0;
 
   constructor(config: OpenLoopConfig, client: OpencodeClient, stateDir: string, selections: SelectionStore) {
@@ -439,6 +464,44 @@ export class LoopRuntime {
   /** Fetch the live catalog (for the setup/config tools). */
   async getCatalog(): Promise<Catalog> {
     return fetchCatalog(this.client, this.config.projectDir);
+  }
+
+  /** Execute constrained package scripts only for the active reviewer root. */
+  async runReviewerVerification(
+    sessionID: string,
+    requestedScripts: readonly string[] | undefined,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    if (!this.config.reviewerVerification) {
+      throw new OpenLoopError("reviewer verification is disabled by OPENLOOP_REVIEWER_VERIFICATION");
+    }
+    const machine = this.machine;
+    const reviewerSessionID = machine?.snapshot().reviewerSessionID;
+    if (!machine || machine.phase !== "REVIEWER_RUNNING" || reviewerSessionID !== sessionID) {
+      throw new OpenLoopError("openloop_verify may only be called by the active OpenLoop reviewer session");
+    }
+    if (this.verificationRunning) throw new OpenLoopError("reviewer verification is already running");
+
+    const abort = new AbortController();
+    const relayAbort = () => abort.abort();
+    signal?.addEventListener("abort", relayAbort, {once: true});
+    if (signal?.aborted) abort.abort();
+    this.verificationRunning = true;
+    this.verificationAbort = abort;
+    try {
+      const report = await runPackageVerification({
+        projectDir: this.config.projectDir,
+        allowedScripts: this.config.reviewerVerificationScripts,
+        requestedScripts,
+        timeoutMs: this.config.verificationTimeoutMs,
+        signal: abort.signal,
+      });
+      return formatVerificationReport(report);
+    } finally {
+      signal?.removeEventListener("abort", relayAbort);
+      if (this.verificationAbort === abort) this.verificationAbort = null;
+      this.verificationRunning = false;
+    }
   }
 
   /** Start a new loop for a goal. Resolves with the final outcome. */
@@ -505,6 +568,7 @@ export class LoopRuntime {
   /** Stop the loop (cooperative). */
   async stop(): Promise<void> {
     if (!this.machine) return;
+    this.verificationAbort?.abort();
     const machine = this.machine;
     const token = this.runToken;
     this.watchdog?.cancel();
@@ -523,6 +587,7 @@ export class LoopRuntime {
 
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.verificationAbort?.abort();
     await this.stop();
     this.watchdog?.cancel();
     try {

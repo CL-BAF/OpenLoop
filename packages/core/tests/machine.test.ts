@@ -5,7 +5,9 @@ import type {OpenLoopConfig, TurnResult, PersistedState} from "../src/types.js";
 function cfg(over: Partial<OpenLoopConfig> = {}): OpenLoopConfig {
   return {
     coderModel: null, reviewerModel: null, coderAgent: "build", reviewerAgent: "build",
-    maxRounds: 3, reviewerReadonly: true, turnTimeoutMs: 60000, pollIntervalMs: 1000,
+    maxRounds: 3, reviewerReadonly: true,
+    reviewerVerification: true, reviewerVerificationScripts: ["test"], verificationTimeoutMs: 60000,
+    turnTimeoutMs: 60000, pollIntervalMs: 1000,
     projectDir: "/tmp/proj", stateDir: "/tmp/proj/.opencode-orchestrator",
     ...over,
   };

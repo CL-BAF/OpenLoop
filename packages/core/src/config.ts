@@ -28,6 +28,20 @@ function envBool(key: string, fallback: boolean): boolean {
   throw new ConfigError(`${key} must be a boolean, got: ${raw}`);
 }
 
+function envScriptList(key: string, fallback: string[]): string[] {
+  const raw = env(key);
+  if (raw === undefined) return [...fallback];
+  const scripts = [...new Set(raw.split(",").map((value) => value.trim()).filter(Boolean))];
+  if (scripts.length === 0) throw new ConfigError(`${key} must contain at least one package script name`);
+  if (scripts.length > 20) throw new ConfigError(`${key} may contain at most 20 package script names`);
+  for (const script of scripts) {
+    if (!/^[A-Za-z0-9:_-]{1,128}$/.test(script)) {
+      throw new ConfigError(`${key} contains an invalid package script name: ${script}`);
+    }
+  }
+  return scripts;
+}
+
 function parseModel(value: string | undefined, fieldName: string): ModelRef | null {
   if (!value) return null;
   const separator = value.indexOf("/");
@@ -53,6 +67,12 @@ export function loadConfig(input: LoadConfigInput): OpenLoopConfig {
   const reviewerAgent = env("OPENLOOP_REVIEWER_AGENT") ?? "build";
   const maxRounds = envInt("OPENLOOP_MAX_ROUNDS", 6);
   const reviewerReadonly = envBool("OPENLOOP_REVIEWER_READONLY", true);
+  const reviewerVerification = envBool("OPENLOOP_REVIEWER_VERIFICATION", true);
+  const reviewerVerificationScripts = envScriptList(
+    "OPENLOOP_REVIEWER_VERIFY_SCRIPTS",
+    ["test", "typecheck", "lint", "build", "check"],
+  );
+  const verificationTimeoutMs = envInt("OPENLOOP_VERIFICATION_TIMEOUT_MS", 10 * 60 * 1000);
   const turnTimeoutMs = envInt("OPENLOOP_TURN_TIMEOUT_MS", 30 * 60 * 1000);
   const pollIntervalMs = envInt("OPENLOOP_POLL_INTERVAL_MS", 2000);
 
@@ -63,6 +83,9 @@ export function loadConfig(input: LoadConfigInput): OpenLoopConfig {
     reviewerAgent,
     maxRounds,
     reviewerReadonly,
+    reviewerVerification,
+    reviewerVerificationScripts,
+    verificationTimeoutMs,
     turnTimeoutMs,
     pollIntervalMs,
     projectDir: input.projectDir,

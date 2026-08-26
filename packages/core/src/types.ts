@@ -66,6 +66,12 @@ export interface OpenLoopConfig {
   reviewerAgent: string;
   maxRounds: number;
   reviewerReadonly: boolean;
+  /** Allow the reviewer to execute constrained package-manager verification scripts. */
+  reviewerVerification: boolean;
+  /** Package.json script names the reviewer may select through openloop_verify. */
+  reviewerVerificationScripts: string[];
+  /** Per-script deadline for reviewer verification. */
+  verificationTimeoutMs: number;
   turnTimeoutMs: number;
   pollIntervalMs: number;
   /** Project directory the loop operates on. */

@@ -17,6 +17,8 @@ describe("role-specific prompts", () => {
     expect(reviewer).toContain("You are the REVIEWER agent");
     expect(reviewer).toContain("independently inspect");
     expect(reviewer).toContain("next_coder_prompt");
+    expect(reviewer).toContain("openloop_verify");
+    expect(reviewer).toContain("independently executed");
     expect(builder).not.toBe(reviewer);
     expect(builder).toContain(goal);
     expect(reviewer).toContain(goal);

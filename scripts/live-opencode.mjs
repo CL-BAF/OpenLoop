@@ -53,6 +53,14 @@ try {
       },
     },
   }, null, 2), "utf8");
+  await writeFile(join(fixture, "package.json"), JSON.stringify({
+    name: "openloop-live-verification-fixture",
+    private: true,
+    scripts: {
+      test: "node -e \"console.log('reviewer-live-test-ok')\"",
+      typecheck: "node -e \"console.log('reviewer-live-typecheck-ok')\"",
+    },
+  }, null, 2), "utf8");
   await writeFile(markerPath, "baseline\n", "utf8");
   initializeGitRepository(fixture);
 
@@ -64,11 +72,17 @@ try {
     if (typeof packageJson.version === "string") openCodeVersion = packageJson.version;
   } catch {}
   process.stdout.write(`Starting isolated OpenCode ${openCodeVersion} from ${openCodeBin}\n`);
-  const started = await startOpenCode(openCodeBin, fixture, isolatedConfig, serverLog);
+  const started = await startOpenCode(
+    openCodeBin,
+    fixture,
+    isolatedConfig,
+    `http://127.0.0.1:${modelPort}`,
+    serverLog,
+  );
   openCode = started.process;
   client = started.client;
   const toolIDs = started.toolIDs;
-  for (const id of ["openloop_run", "openloop_start_goal", "openloop_status", "openloop_stop", "openloop_setup", "openloop_config"]) {
+  for (const id of ["openloop_verify", "openloop_run", "openloop_start_goal", "openloop_status", "openloop_stop", "openloop_setup", "openloop_config"]) {
     assert(toolIDs.includes(id), `project-local plugin did not register ${id}`);
   }
   const resolvedConfig = unwrap(await withDeadline(client.config.get({directory: fixture}), 30_000, "resolved config"), "resolved config");
@@ -95,7 +109,11 @@ try {
     model: `${model.providerID}/${model.modelID}`,
   }), 30_000, "/OpenLoop command"), "/OpenLoop command");
   const outcome = await withDeadline(waitForOutcome(join(stateDir, "state.json")), 120_000, "live loop");
-  assert.deepEqual(outcome, {kind: "PASS", rounds: 2, finalSummary: "The round-two repair is correct."});
+  assert.deepEqual(outcome, {
+    kind: "PASS",
+    rounds: 2,
+    finalSummary: "Independent test and typecheck scripts passed; the round-two repair is correct.",
+  });
 
   const sessions = unwrap(await client.session.list(), "session list");
   const coder = sessions.find((session) => session.title === "CODER (openloop)");
@@ -114,6 +132,7 @@ try {
   for (const permission of ["edit", "write", "apply_patch", "bash", "task", "openloop_start_goal", "openloop_run"]) {
     assert(denied.has(permission), `reviewer lost read-only deny for ${permission}`);
   }
+  assert(!denied.has("openloop_verify"), "reviewer verification tool was incorrectly denied");
 
   const coderMessages = unwrap(await client.session.messages({sessionID: coder.id}), "coder messages");
   const reviewerMessages = unwrap(await client.session.messages({sessionID: reviewer.id}), "reviewer messages");
@@ -122,6 +141,11 @@ try {
   const coderText = messageText(coderMessages);
   assert(coderText.includes("Independent review guidance") && coderText.includes("round-two-fixed"), "review findings did not reach the coder");
   assert(messageText(reviewerMessages).includes("openloop-smoke.txt"), "coder diff did not reach the reviewer");
+  assert.equal(
+    modelLog.filter((entry) => entry === "MODEL_CALL openloop_verify").length,
+    2,
+    "reviewer did not independently invoke openloop_verify exactly once in each round",
+  );
   assert.equal(await readFile(markerPath, "utf8"), "round-two-fixed\n");
 
   const persisted = JSON.parse(await readFile(join(stateDir, "state.json"), "utf8"));
@@ -191,7 +215,7 @@ function openCodeExecutable() {
   return "opencode";
 }
 
-async function startOpenCode(openCodeBin, projectDirectory, isolatedConfig, aggregateLog) {
+async function startOpenCode(openCodeBin, projectDirectory, isolatedConfig, modelsURL, aggregateLog) {
   const attempts = process.platform === "win32" ? 2 : 1;
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -210,6 +234,10 @@ async function startOpenCode(openCodeBin, projectDirectory, isolatedConfig, aggr
         XDG_CACHE_HOME: join(isolatedHome, "cache"),
         XDG_STATE_HOME: join(isolatedHome, "state"),
         OPENCODE_DISABLE_AUTOUPDATE: "true",
+        // Keep the live test deterministic and offline. Current OpenCode
+        // otherwise contacts models.dev during project bootstrap even though
+        // this fixture declares its complete provider catalog locally.
+        OPENCODE_MODELS_URL: modelsURL,
       },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
@@ -325,6 +353,9 @@ async function reservePort() {
 async function startModelServer(outputPath, requests) {
   const server = createServer(async (request, response) => {
     if (requests.length < 20) requests.push(`${request.method} ${request.url}`);
+    if (request.method === "GET" && request.url === "/api.json") {
+      return json(response, {});
+    }
     if (request.method === "GET" && request.url === "/v1/models") {
       return json(response, {object: "list", data: [{id: "deterministic", object: "model", owned_by: "openloop"}]});
     }
@@ -345,6 +376,11 @@ async function startModelServer(outputPath, requests) {
         }))));
       }
       const latestUser = [...messages].reverse().find((message) => message.role === "user");
+      const latestUserIndex = messages.findLastIndex((message) => message.role === "user");
+      const verificationCalled = messages.slice(latestUserIndex + 1).some((message) =>
+        message.role === "assistant"
+        && message.tool_calls?.some((call) => call.function?.name === "openloop_verify"),
+      );
       const latestTool = messages.at(-1)?.role === "tool";
       const reviewer = /^# Goal under review/m.test(contentText(latestUser));
       const openLoopCommand = /Call openloop_run exactly once/.test(contentText(latestUser));
@@ -354,7 +390,15 @@ async function startModelServer(outputPath, requests) {
         const spec = /Builder=[\s\S]*$/m.exec(contentText(latestUser))?.[0]?.trim();
         if (!spec) throw new Error("/OpenLoop command template did not preserve $ARGUMENTS");
         payload = toolCall("openloop_run", {spec});
+      } else if (reviewer && !verificationCalled) {
+        requests.push("MODEL_CALL openloop_verify");
+        payload = toolCall("openloop_verify", {checks: ["test", "typecheck"]});
       } else if (reviewer) {
+        const verificationOutput = contentText(messages.at(-1));
+        if (!verificationOutput.includes("reviewer-live-test-ok")
+          || !verificationOutput.includes("reviewer-live-typecheck-ok")) {
+          throw new Error("reviewer did not receive both independent verification results");
+        }
         const round = Number(/round\s+(\d+)/i.exec(contentText(latestUser))?.[1] ?? 1);
         const verdict = round === 1 ? {
           verdict: "CHANGES_REQUIRED",
@@ -372,7 +416,7 @@ async function startModelServer(outputPath, requests) {
           future_improvements: [],
         } : {
           verdict: "PASS",
-          summary: "The round-two repair is correct.",
+          summary: "Independent test and typecheck scripts passed; the round-two repair is correct.",
           findings: [],
           next_coder_prompt: "",
           research: {performed: false},

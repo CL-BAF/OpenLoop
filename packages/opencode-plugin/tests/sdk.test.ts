@@ -20,7 +20,7 @@ describe("reviewer read-only permissions", () => {
     const client = {
       tool: {
         ids: async () => ({
-          data: ["read", "grep", "edit", "apply_patch", "custom_mutator"],
+          data: ["read", "grep", "openloop_verify", "edit", "apply_patch", "custom_mutator"],
           error: undefined,
           response: undefined,
         }),
@@ -36,6 +36,7 @@ describe("reviewer read-only permissions", () => {
     ]));
     expect(permissions).not.toContainEqual(expect.objectContaining({permission: "read"}));
     expect(permissions).not.toContainEqual(expect.objectContaining({permission: "grep"}));
+    expect(permissions).not.toContainEqual(expect.objectContaining({permission: "openloop_verify"}));
     expect(permissions.filter((rule) => rule.permission === "edit")).toHaveLength(1);
   });
 });

@@ -1,5 +1,5 @@
 import {describe, it, expect, vi, beforeEach, afterEach} from "vitest";
-import {mkdtempSync, readFileSync, rmSync, writeFileSync} from "node:fs";
+import {existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {LoopRuntime} from "../src/index.js";
@@ -110,7 +110,7 @@ function mockClient(opts: MockOptions = {}): OpencodeClient {
     },
     tool: {
       ids: vi.fn(async () => ({
-        data: ["read", "grep", "bash", "edit", "task", "openloop_start_goal", "openloop_run"],
+        data: ["read", "grep", "bash", "edit", "task", "openloop_verify", "openloop_start_goal", "openloop_run"],
         error: undefined,
         response: undefined as never,
       })),
@@ -122,6 +122,7 @@ function makeRuntime(client: OpencodeClient, over: Record<string, unknown> = {})
   const config = {
     coderModel: null, reviewerModel: null, coderAgent: "build", reviewerAgent: "build",
     maxRounds: 3, reviewerReadonly: true, turnTimeoutMs: 500, pollIntervalMs: 10,
+    reviewerVerification: true, reviewerVerificationScripts: ["test"], verificationTimeoutMs: 500,
     projectDir: dir, stateDir: dir, ...over,
   } as never;
   return new LoopRuntime(config, client, dir, new SelectionStore(dir));
@@ -135,6 +136,59 @@ function deferred<T>() {
 }
 
 describe("LoopRuntime integration-shaped orchestration", () => {
+  it("allows constrained verification only from the active reviewer root", async () => {
+    writeFileSync(join(dir, "package.json"), JSON.stringify({
+      name: "runtime-verification-fixture",
+      private: true,
+      scripts: {test: "node -e \"console.log('reviewer-runtime-check-ok')\""},
+    }), "utf8");
+    const client = mockClient({statusAfterPrompt: "busy"});
+    const rt = makeRuntime(client, {
+      turnTimeoutMs: 30_000,
+      pollIntervalMs: 30_000,
+      verificationTimeoutMs: 30_000,
+    });
+    const running = rt.start("goal");
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(1));
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "coder-1"}} as never);
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(2));
+
+    await expect(rt.runReviewerVerification("coder-1", ["test"]))
+      .rejects.toThrow("active OpenLoop reviewer");
+    await expect(rt.runReviewerVerification("reviewer-1", ["test"]))
+      .resolves.toContain("reviewer-runtime-check-ok");
+
+    await rt.stop();
+    await expect(running).resolves.toMatchObject({kind: "ABORTED"});
+  });
+
+  it("aborts reviewer verification when the loop is stopped", async () => {
+    writeFileSync(join(dir, "package.json"), JSON.stringify({
+      name: "runtime-verification-abort-fixture",
+      private: true,
+      scripts: {
+        test: "node -e \"require('fs').writeFileSync('verification-ready', 'ready'); setTimeout(() => {}, 10000)\"",
+      },
+    }), "utf8");
+    const client = mockClient({statusAfterPrompt: "busy"});
+    const rt = makeRuntime(client, {
+      turnTimeoutMs: 30_000,
+      pollIntervalMs: 30_000,
+      verificationTimeoutMs: 30_000,
+    });
+    const running = rt.start("goal");
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(1));
+    await rt.handleEvent({type: "session.idle", properties: {sessionID: "coder-1"}} as never);
+    await vi.waitFor(() => expect(client.session.promptAsync).toHaveBeenCalledTimes(2));
+
+    const verification = rt.runReviewerVerification("reviewer-1", ["test"]);
+    await vi.waitFor(() => expect(existsSync(join(dir, "verification-ready"))).toBe(true), {timeout: 3_000});
+    await rt.stop();
+
+    await expect(verification).resolves.toContain("ABORTED");
+    await expect(running).resolves.toMatchObject({kind: "ABORTED"});
+  });
+
   it("runs coder -> exact diff -> read-only reviewer -> PASS and persists the round", async () => {
     const client = mockClient();
     const rt = makeRuntime(client);
@@ -152,6 +206,9 @@ describe("LoopRuntime integration-shaped orchestration", () => {
       {permission: "openloop_start_goal", pattern: "*", action: "deny"},
       {permission: "openloop_run", pattern: "*", action: "deny"},
     ]));
+    expect(reviewerCreate![0].permission).not.toContainEqual(
+      expect.objectContaining({permission: "openloop_verify", action: "deny"}),
+    );
 
     const prompts = (client.session.promptAsync as ReturnType<typeof vi.fn>).mock.calls;
     expect(prompts).toHaveLength(2);

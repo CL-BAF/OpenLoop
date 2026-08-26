@@ -131,7 +131,7 @@ Use the complete result, including the provider prefix. For example, use `ollama
 OpenLoop generates separate prompts for each role from the goal:
 
 - The builder prompt emphasizes repository inspection, root-cause implementation, scoped changes, and exact verification results.
-- The reviewer prompt emphasizes independent inspection, comparison with the exact builder-session diff, security and compatibility checks, and a strict structured verdict.
+- The reviewer prompt emphasizes independent inspection, comparison with the exact builder-session diff, security and compatibility checks, independent execution of relevant approved verification scripts, and a strict structured verdict.
 - On `CHANGES_REQUIRED`, the reviewer produces a prioritized `next_coder_prompt`. OpenLoop combines it with the original authoritative goal and sends it back to the builder for the next round.
 - On `PASS`, the loop ends and persists the final result.
 
@@ -153,6 +153,7 @@ OpenLoop's tools are:
 | `openloop_start_goal` | Start a run using already saved selections |
 | `openloop_status` | Report progress and the final outcome |
 | `openloop_stop` | Abort the current turn and stop the run |
+| `openloop_verify` | Let the active reviewer run approved `package.json` verification scripts without arbitrary shell access |
 | `openloop_setup` | List or change validated agent/model selections |
 | `openloop_config` | Show current selections and loop settings |
 
@@ -178,6 +179,9 @@ Environment variables provide initial/default settings when the plugin loads:
 | `OPENLOOP_REVIEWER_AGENT` | `build` | Reviewer primary-agent ID |
 | `OPENLOOP_MAX_ROUNDS` | `6` | Maximum builder/reviewer rounds |
 | `OPENLOOP_REVIEWER_READONLY` | `true` | Enforce reviewer read-only permissions |
+| `OPENLOOP_REVIEWER_VERIFICATION` | `true` | Enable constrained reviewer verification |
+| `OPENLOOP_REVIEWER_VERIFY_SCRIPTS` | `test,typecheck,lint,build,check` | Comma-separated `package.json` script names the reviewer may run |
+| `OPENLOOP_VERIFICATION_TIMEOUT_MS` | `600000` | Timeout for each reviewer verification script |
 | `OPENLOOP_TURN_TIMEOUT_MS` | `1800000` | Per-turn timeout in milliseconds |
 | `OPENLOOP_POLL_INTERVAL_MS` | `2000` | Idle-status fallback polling interval |
 | `OPENLOOP_LOG_LEVEL` | `info` | Logging level |
@@ -186,9 +190,13 @@ OpenLoop does not load `.env` files itself. Environment variables must be presen
 
 ## Reviewer read-only enforcement
 
-Read-only mode is enabled by default. When the reviewer root session is created, OpenLoop queries the active tool catalog and adds persistent deny rules for every tool that is not explicitly classified as read-only. Known mutation capabilities such as editing, shell execution, task delegation, and OpenLoop start/run tools are denied.
+Read-only mode is enabled by default. When the reviewer root session is created, OpenLoop queries the active tool catalog and adds persistent deny rules for every tool that is not explicitly classified as read-only. Editing, arbitrary shell execution, task delegation, and OpenLoop start/run tools remain denied.
 
 This is enforced at the reviewer session boundary rather than only requested in the prompt. If the live tool catalog cannot be queried, OpenLoop fails closed instead of creating a reviewer with uncertain permissions.
+
+The reviewer receives one deliberately narrow execution capability: `openloop_verify`. It can be called only by the active reviewer root while a review turn is running. It accepts package-script names, not commands or arguments, and permits only names listed by `OPENLOOP_REVIEWER_VERIFY_SCRIPTS` that actually exist in the project's `package.json`. Scripts run sequentially with a per-script timeout, abort handling, Windows process-tree termination, and capped output. If no approved script exists, the reviewer must report that verification was unavailable rather than relying silently on the builder's claim.
+
+This is a model-facing least-privilege boundary, not an operating-system sandbox. A permitted package script executes the command already defined by the repository and may generate normal test or build artifacts. Review projects and package scripts as you would before running `npm test`; use a separate OS sandbox for untrusted repositories.
 
 ## Reliability behavior
 
@@ -197,6 +205,7 @@ This is enforced at the reviewer session boundary rather than only requested in 
 - Retry states and temporary busy states are handled without overlapping prompts.
 - Duplicate or stale completion events are ignored.
 - Stop requests invalidate in-flight work so late responses cannot restart a stopped run.
+- Stop and dispose requests terminate in-flight reviewer verification, including child processes on Windows.
 - State writes are atomic and persisted after meaningful transitions.
 - Malformed reviewer output produces an error instead of a false `PASS`.
 - Coder and reviewer session IDs are checked to ensure they are distinct root sessions.
@@ -233,6 +242,21 @@ opencode models <provider>
 
 Use the complete `provider/model` value returned by that command. OpenLoop uses OpenCode's injected plugin client, which is required for embedded Desktop and terminal sessions that do not expose a separate HTTP listener.
 
+### The reviewer says verification is unavailable
+
+OpenLoop only offers scripts that are both approved by `OPENLOOP_REVIEWER_VERIFY_SCRIPTS` and present in the target project's `package.json`. Confirm the project has suitable scripts, for example:
+
+```json
+{
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  }
+}
+```
+
+Custom names such as `test:unit` can be added to the comma-separated environment setting before OpenCode/Desktop starts. Do not put command text or command-line arguments in that setting.
+
 ### OpenCode tries to install `@openloop/opencode-plugin`
 
 The npm package is not published. Remove stale entries such as the following from project or global OpenCode configuration:
@@ -267,14 +291,14 @@ npm test
 npm run test:live
 ```
 
-`test:live` starts an isolated OpenCode server with a deterministic local model endpoint. It verifies two independent root sessions, builder-to-reviewer diff transfer, reviewer-to-builder fix guidance, read-only reviewer permissions, two rounds, persistence, and a final `PASS` without using a paid model.
+`test:live` starts an isolated OpenCode server with a deterministic local model endpoint. It verifies two independent root sessions, builder-to-reviewer diff transfer, independent constrained reviewer test/typecheck execution, reviewer-to-builder fix guidance, read-only reviewer permissions, two rounds, persistence, and a final `PASS` without using a paid model.
 
 ## Scope and limitations
 
 - OpenLoop coordinates sessions within one OpenCode project; it does not connect or control two manually opened Desktop tabs.
 - OpenCode custom commands are prompt templates. `/OpenLoop` instructs the active agent to call `openloop_run`; the tool itself performs strict parsing, catalog validation, persistence, and loop startup.
-- The reviewer is read-only with respect to OpenCode tools. It can inspect the shared working tree, including changes made by the builder.
-- Read-only mode prevents the reviewer from executing shell-based test commands; it inspects code and test changes while the builder remains responsible for running verification.
+- The reviewer cannot edit through OpenCode tools or use an arbitrary shell. It can inspect the shared working tree and run only the approved `package.json` scripts exposed by `openloop_verify`.
+- Package scripts are repository code, not a pure read operation; they may create caches, coverage reports, generated files, or other normal artifacts.
 - Both roles use models and primary agents already available in the active OpenCode environment.
 - In-flight runs are not resumed after OpenCode/Desktop restarts; start a new run after restarting.
 - Both worker sessions share one working tree. Avoid running another writer against the same project during a loop.
